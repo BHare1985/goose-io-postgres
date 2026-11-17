@@ -419,16 +419,14 @@ users, is [architecture](architecture.md).
   ring and on IOCP, `wait_socket` fails with `ENOSYS`, and every pooled query fails
   with that reason. The module is `pg.pool`, beside `pg.socket`, which it imports
   for the server's address (2026-10-23, task 005).
-- **A pool for goose-io's contract is a goose-io library, in its own module.**
-  `pg.iopool` follows the shape goose-io's `docs/libraries.md` gives: one state struct
-  the host owns and one `io_event` entry point that checks its own tag, with no
-  callback stored and no provider named. It is a separate module, and not a port of
-  `pg.pool`, because goose-http's pool is built on `wait_socket` and mail, which the
-  contract has no counterpart for; the facade and the protocol are unchanged, so the
-  blocking facade still runs on goose-http's socket. A query is submitted, its rows go
-  to the host's block as they arrive, and its end is taken with `io_take`. The rows
-  are not held until the answer is whole, as `pg.pool` holds them, so a query that fails
-  after some rows has given those; the contract's `Data` is lent, and holding the answer
-  would need a buffer per connection of the same size anyway. Each query is the unnamed
-  statement, so a connection keeps no statements to track; prepared statements, and
-  pipelining on a connection, wait for a need (2026-11-17).
+- **The pool runs on goose-io's contract, with `pg::pool` and `pg::query` as they
+  were.** goose-http's mail, `wait_socket`, and `recv` have no counterpart in the
+  contract, whose events are pushed, so `pg::pool_event` takes each event into its
+  connection's buffer and the route calls `pg::query` at every event, as it called it
+  at every wake; `query` takes `io` where it took `out, kind, data`. The queue of
+  waiting requests and its mail are gone: a request polls for a connection at each
+  call, so waiters are not served in order and `"53300"` no longer exists. `ms` limits
+  the whole query, since there is no wait to renew it, and a request that is never
+  called again is found by its time running out. Addresses are numeric. The blocking
+  facade stays on goose-http's socket: the contract has no blocking receive, and
+  `serve` cannot be run for one read (2026-11-17).

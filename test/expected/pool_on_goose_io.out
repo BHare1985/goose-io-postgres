@@ -1,0 +1,9 @@
+-- two queries on one connection
+first row: 1 one
+first row: 2 two
+first: 2 rows
+second failed 42601 syntax error
+the password went in cleartext: ok
+the parameter went as text: ok
+-- a server that refuses
+first failed 08001 can't connect to the database

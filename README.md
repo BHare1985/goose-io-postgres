@@ -10,7 +10,7 @@ outbound connections ([architecture](docs/architecture.md)).
 The protocol works against Postgres 18, and so does a blocking facade for Plod's
 lanes, over goose-http's blocking socket or a transport the program supplies:
 `pg::query` with a block per row, `pg::exec`, errors through `pg::run`, and a
-`pg::transaction` block, nested as savepoints. A pool on goose-http's loop, a pool
+`pg::transaction` block, nested as savepoints. A pool on a goose-io loop, a pool
 per worker, runs single queries for a route without a lane, as HttpArena's
 `/async-db` asks. Queries in parallel on the facade come next
 ([tasks](tasks/README.md)).
@@ -29,8 +29,7 @@ per worker, runs single queries for a route without a lane, as HttpArena's
 | 🟢 | Transactions | `pg::transaction(db) { ... }` on the facade, as goose-sqlite's: it commits, or rolls back on a failed call or `pg::fail` and returns the error; nested, a savepoint that undoes only its own work. |
 | 🟡 | Queries in parallel | Several queries in one round trip on the facade (task 003). |
 | 🟢 | goose-http's blocking socket as the facade's transport | The module `pg.socket`: `pg::open` over TCP or a Unix socket, with a time limit on each wait. |
-| 🟡 | A pool | The module `pg.pool`: a pool per worker on goose-http's loop, `serve_epoll`'s or io_uring's, opened as requests need it, with a queue for requests that find no idle connection and reconnects after failures. Tested live on macOS; the Plod program for HttpArena's `/async-db` and its measurement are next (task 005). |
-| 🟡 | A pool on goose-io's contract | The module `pg.iopool`: a goose-io library, so it runs on any provider of that contract. Queries are submitted and their rows go to a block as they arrive; one query at a time per connection, as the unnamed statement. Tested against goose-io's in-memory provider (`test/io/`); not yet against a real provider or server. |
+| 🟡 | A pool | The module `pg.pool`: a pool per loop on any provider of [goose-io](https://github.com/BHare1985/goose-io)'s I/O contract, opened as requests need it, with reconnects after failures. Tested against goose-io's in-memory provider and a scripted server; not yet against a real provider or a live Postgres, and `test/live/pool.goose`, which drove it from goose-http's routes, is not ported (task 005). |
 | 🔴 | TLS | Through goose-tls's client mode, for servers that ask for it. Until then a URL with `sslmode=require`, `verify-ca`, or `verify-full` is refused. |
 | 🔴 | More types | Floats, `numeric`, dates and times, `uuid`, and arrays; `pg::bytes` gives their raw bytes. |
 
@@ -187,13 +186,13 @@ The facade ([architecture](docs/architecture.md#the-facade)):
 
 The pool, in `pg.pool` ([architecture](docs/architecture.md#the-pool)):
 
-- `pg::pool(cfg, size) -> Pool`: a worker's connections, opened as requests need them.
+- `pg::pool(cfg, size, tag = 1) -> Pool`: a loop's connections, opened as requests need them; `pg::pool_event(pool, io, ev)` takes each event of the loop for them.
 - `pg::Ticket { .. }`: a request's place with the pool, in its state.
-- `pg::query(pool, t, out, kind, data, ms, sql, p1, ..., p8) { r => ... } -> i64`:
+- `pg::query(pool, t, io, ms, sql, p1, ..., p8) { r => ... } -> i64`:
   called at the request and at each later event; `pg::WAITS` while the exchange
   waits, the count once the block has seen every row, or `pg::FAILS`, with `t.code`
   and `pool.reason`.
-- `pg::close(pool)`.
+- `pg::close(pool, io)`.
 
 ## Credits
 
@@ -213,7 +212,7 @@ decode.goose   reading rows, columns, errors, and command tags
 url.goose      Config, and postgres:// URLs
 facade.goose   the blocking facade: Db, connect, query, exec, run, and fail
 socket.goose   the module pg.socket: the facade over goose-http's socket, and open
-pool.goose     the module pg.pool: a pool per worker on goose-http's loop
+pool.goose     the module pg.pool: a pool per loop on a goose-io loop
 test/          unit tests, session tests that replay captures from Postgres, and
                test/live/, which needs one
 scripts/       the Goose pin, the test scripts, and the live run in Docker with its relay
