@@ -97,6 +97,38 @@ fn event(app: App&, io: goose_io_memory::Loop&, ev: goose_io::Event) {
     if app.finished == 2 { io.stop(0); }
 }
 
+
+// Another library on the same loop: it dials its own server and counts the bytes that come back.
+struct Counter { link: goose_io::Link = goose_io::Link { .. }, bytes: i64 = 0, closed: bool = false }
+
+// Returns true if the event was this library's, as a library on a shared loop must.
+fn counter_event(c: Counter&, ev: goose_io::Event) -> bool {
+    guard goose_io::is_link_event(ev) && goose_io::same(c.link, goose_io::link_of(ev)) else { return false; }
+    match ev {
+        Data e => { c.bytes += e.bytes.len; },
+        Closed e => { c.closed = true; },
+        _ => {},
+    }
+    return true;
+}
+
+struct Shared { counter: Counter, pool_took: i64 = 0, counter_took: i64 = 0, both: i64 = 0, app: App }
+
+fn shared_event(sh: Shared&, io: goose_io_memory::Loop&, ev: goose_io::Event) {
+    // Every library is offered every event; each takes only its own.
+    let a = pg::pool_event(sh.app.pool, io, ev);
+    let b = counter_event(sh.counter, ev);
+    if a { sh.pool_took++; }
+    if b { sh.counter_took++; }
+    if a && b { sh.both++; }
+    loop {
+        let key = pg::wake(sh.app.pool);
+        if key == 0 { break; }
+        if key == sh.app.t1.key { route(sh.app, sh.app.t1, 1, io); }
+    }
+    if sh.app.finished == 2 && sh.counter.bytes == 11 { io.stop(0); }
+}
+
 fn config(host: const u8[:]) -> pg::Config {
     var cfg = pg::Config { .. };
     cfg.host.append(host);
@@ -154,4 +186,24 @@ fn main() {
     io4.serve() { io, ev => event(app4, io, ev); };
     check::that("the timed-out request gave its connection up", app4.pool.slots[0].owner == 0);
     check::that("and the connection was hung up, as a server that doesn't answer may not answer at all", app4.pool.slots[0].phase == pg::SLOT_CLOSED);
+
+    print("-- the pool and another library on one loop: each takes only its own events");
+    var io5 = goose_io_memory::Loop { .. };
+    let pg_server = io5.add_peer();
+    io5.peer_accept(pg_server, "10.0.0.8:5432");
+    io5.peer_send(pg_server, 1, check::message_of('R', check::auth(3, "")));
+    io5.peer_send(pg_server, 5, login());
+    io5.peer_send(pg_server, 20, first_answer());
+    let other_server = io5.add_peer();
+    io5.peer_accept(other_server, "10.0.0.9:7000");
+    io5.peer_send(other_server, 10, "hello world");
+    var sh = Shared { counter: Counter { .. }, app: App { finished: 1, pool: pg::pool(config("10.0.0.8"), 1) }, .. };
+    sh.app.t2.state = pg::TICKET_DONE;
+    sh.counter.link = io5.dial("10.0.0.9:7000", 1000);
+    route(sh.app, sh.app.t1, 1, io5);
+    io5.serve() { io, ev => shared_event(sh, io, ev); };
+    check::that("the other library got its 11 bytes", sh.counter.bytes == 11);
+    check::that("the pool's request finished", sh.app.finished == 2);
+    check::that("no event was taken by both libraries", sh.both == 0);
+    check::that("each library took events", sh.pool_took > 0 && sh.counter_took > 0);
 }

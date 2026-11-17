@@ -495,7 +495,7 @@ fn handle(io: Io&, st: St&, db: pg::Pool&) {      // a request, at its start and
     respond(200, body);
 }
 
-var db = pg::pool(db_cfg, per_loop, TAG);         // DATABASE_MAX_CONN / loops
+var db = pg::pool(db_cfg, per_loop);              // DATABASE_MAX_CONN / loops
 io.serve() { io, ev =>
     pg::pool_event(db, io, ev);                   // the pool's links, and the time
     loop {
@@ -508,12 +508,13 @@ io.serve() { io, ev =>
 pg::close(db, io);
 ```
 
-- `pg::pool(cfg, size, tag = 1) -> Pool`: `size` connections, at least one, none open yet, whose
-  links carry `tag`. Keep it last in the loop's state: its connections end it.
+- `pg::pool(cfg, size) -> Pool`: `size` connections, at least one, none open yet. Keep it last in
+  the loop's state: its connections end it.
 - `pg::pool_event(pool, io, ev) -> bool`: takes one event of the loop. The data, opening and
-  closing of the pool's links (the ones with its tag) go to their connections; a `Tick` names the
+  closing of the pool's links (the ones its connections hold) go to their connections; a `Tick` names the
   requests whose time has run out. True if the event was the pool's. It does work in proportion
-  to the event: the link's user value says which connection it is.
+  to the event: it finds the connection that holds the link, among the pool's few, and ignores the
+  events of every other link, which are another library's.
 - `pg::wake(pool) -> u32`: the key of the next request to call, or 0. Take it until it gives 0
   after each `pool_event`. A request's key is `t.key`, set by its first `query` call.
 - `pg::Ticket { .. }`: a request's place with the pool, in the request's state. `t.code` holds a

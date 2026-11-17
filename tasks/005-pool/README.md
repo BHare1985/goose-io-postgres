@@ -1,8 +1,8 @@
 # 005: A pool on a goose-io event loop
 
 Update 2026-11-17: the pool no longer runs on goose-http's loop. `pool.goose` is generic over a
-[goose-io](https://github.com/BHare1985/goose-io) event loop (`docs/decisions.md`, the last
-entry): it takes the loop's events with `pg::pool_event` and names the request an event
+[goose-io](https://github.com/BHare1985/goose-io) event loop (`docs/decisions.md`, the entries of 2026-11-17):
+it takes the loop's events with `pg::pool_event` and names the request an event
 concerns with `pg::wake`. The design questions below were settled for goose-http and are kept
 as the record; where they speak of exchanges, mail, `later` and `wait_socket`, the pool now has a
 queue of request keys, `wake`, and per-wait limits renewed by a connection's events. The live

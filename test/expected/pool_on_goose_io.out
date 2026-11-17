@@ -17,3 +17,11 @@ request 1 failed 08006 the database didn't answer in time
 request 2 failed 08006 the database didn't answer in time
 the timed-out request gave its connection up: ok
 and the connection was hung up, as a server that doesn't answer may not answer at all: ok
+-- the pool and another library on one loop: each takes only its own events
+request 1 row: 1 one
+request 1 row: 2 two
+request 1: 2 rows
+the other library got its 11 bytes: ok
+the pool's request finished: ok
+no event was taken by both libraries: ok
+each library took events: ok

@@ -438,3 +438,10 @@ users, is [architecture](architecture.md).
   from the loop's lent bytes into its connection's buffer, as goose-http's `recv` copied it from
   the kernel. The facade and `pg.socket` stay on goose-http: the contract has no blocking
   receive, and a coroutine layer over it is a later change (2026-11-17).
+- **The pool finds its connection by the event's link, and takes no part in any other link's
+  events.** Contract 0.2 has no tag and no user value, so `pool_event` compares the event's link
+  with each connection's, a scan of the pool's size (a handful), and returns false for a link it
+  does not hold. A `goose_io::LinkMap` would be one lookup, but it holds an array and so cannot sit
+  in `Pool` beside `slots` (one resizable field to a struct); a scan keeps the pool one value the
+  program holds, with nothing else to build. Another library on the same loop is offered each event
+  the same way and takes its own; `test/io/pool_on_goose_io.goose` runs both on one loop (2026-11-17).

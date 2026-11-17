@@ -11,7 +11,7 @@
 //   import goose_io from "github.com/BHare1985/goose-io@<tag>";
 //   import pg.pool;
 //
-//   var db = pg::pool(cfg, per_loop, TAG);       // before serve; TAG is the pool's tag
+//   var db = pg::pool(cfg, per_loop);            // before serve
 //
 //   // the loop's handler: each event goes to the pool, then every request it names is called
 //   io.serve() { io, ev =>
@@ -124,7 +124,6 @@ struct Waiter { key: u32 = 0, until: i64 = 0, due: bool = false }
 // and keep it last in that thread's state: the connections end it.
 struct Pool {
     cfg: Config,
-    tag: u16 = 1,
     next_key: u32 = 1,
     // Statement k is named "gp<k>"; its SQL is sql[ends[k - 1]..ends[k]].
     statements: i64 = 0,
@@ -144,13 +143,13 @@ struct Pool {
 }
 
 // A pool of size connections, at least one, to cfg's server, none open yet:
-// each opens when a request needs it, and its links carry tag. A pooled
+// each opens when a request needs it. A pooled
 // connection takes messages up to POOL_INPUT - 1 bytes, or cfg.max_message if
 // lower. The host is a numeric address, as goose-io's are, or, when it starts
 // with /, the directory of the server's Unix socket on an event loop that
 // supplies goose-io's unix group; a host name fails the dial.
-fn pool(cfg: Config, size: i64, tag: u16 = 1) -> Pool {
-    var p = Pool { cfg: cfg, tag: tag, .. };
+fn pool(cfg: Config, size: i64) -> Pool {
+    var p = Pool { cfg: cfg, .. };
     p.cfg.max_message = min(cfg.max_message, POOL_INPUT - 1);
     for i in max(size, 1) { p.slots.push(Slot { c: Conn { .. }, .. }); }
     return p;
@@ -169,11 +168,11 @@ fn pool_event<Io>(p: Pool&, io: Io&, ev: goose_io::Event) -> bool {
         }
         return false;
     }
-    guard goose_io::tag_of(ev) == p.tag else { return false; }
-    let user = goose_io::user_of(ev);
-    guard user >= 1 && user <= p.slots.len else { return true; }
-    let s .= p.slots[user - 1];
-    guard goose_io::same(s.link, goose_io::link_of(ev)) else { return true; }
+    // A link belongs to the pool if one of its few connections holds it; an event for any other link is
+    // another library's, and the pool takes no part in it.
+    let k = slot_of(p, goose_io::link_of(ev));
+    guard k >= 0 else { return false; }
+    let s .= p.slots[k];
     match ev {
         Opened e => { s.up = true; },
         Closed e => {
@@ -197,6 +196,15 @@ fn pool_event<Io>(p: Pool&, io: Io&, ev: goose_io::Event) -> bool {
     }
     if s.owner != 0 { push_wake(p, s.owner); }
     return true;
+}
+
+// The connection that holds link, or -1.
+fn slot_of(p: Pool&, link: goose_io::Link) -> i64 {
+    guard goose_io::is_valid(link) else { return -1; }
+    for k in p.slots.len {
+        if goose_io::same(p.slots[k].link, link) { return k; }
+    }
+    return -1;
 }
 
 // The key of the next request to call with query, or 0. The request is the one
@@ -507,8 +515,7 @@ fn drive<R, W>(p: Pool&, t: Ticket&, io, ms: i64, sql: const u8[:]) -> i64 {
     loop {
         if s.phase == SLOT_CLOSED {
             let where = pool_address(p.cfg);
-            s.link = io.dial(where[..], p.tag, if ms > 0 { ms } else { 0 });
-            io.set_user(s.link, (t.conn + 1) as u32);
+            s.link = io.dial(where[..], if ms > 0 { ms } else { 0 });
             s.up = false;
             s.eof = false;
             s.phase = SLOT_CONNECTING;

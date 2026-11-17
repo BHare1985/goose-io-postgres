@@ -187,7 +187,7 @@ The facade ([architecture](docs/architecture.md#the-facade)):
 
 The pool, in `pg.pool` ([architecture](docs/architecture.md#the-pool)):
 
-- `pg::pool(cfg, size, tag = 1) -> Pool`: a loop's connections, opened as requests need them.
+- `pg::pool(cfg, size) -> Pool`: a loop's connections, opened as requests need them.
 - `pg::pool_event(pool, io, ev)`: gives the pool one event of the loop; then take
   `pg::wake(pool)` until it gives 0, the key of each request to call.
 - `pg::Ticket { .. }`: a request's place with the pool, in its state; `t.key` is what `wake` gives.
