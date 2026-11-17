@@ -1,7 +1,7 @@
 // The pool (pool.goose) on goose-io's in-memory provider, against a server scripted by time: a cleartext
 // login, a query with a parameter and two rows, a second request that waits in the queue for the one
-// connection and fails, and a dial that is refused. The first query is made before the loop runs, and the answers come after
-// the session is ready.
+// connection and fails, a dial that is refused, and a server at a Unix socket path. The first query is made
+// before the loop runs, and the answers come after the session is ready.
 import std;
 import hash from "github.com/kaitk/goose-hash@v0.0.4";
 import goose_io from "../../../..";
@@ -136,4 +136,18 @@ fn main() {
     route(app2, app2.t1, 1, httpshim::REQUEST, "");
     httpshim::flush(io2);
     io2.serve() { io, ev => event(app2, io, ev); };
+
+    print("-- a server on a Unix socket, as the host /var/run/postgresql names it");
+    var io3 = goose_io_memory::Loop { .. };
+    let unix_server = io3.add_peer();
+    io3.peer_accept(unix_server, "unix:/var/run/postgresql/.s.PGSQL.5432");
+    io3.peer_send(unix_server, 1, check::message_of('R', check::auth(3, "")));
+    io3.peer_send(unix_server, 5, login());
+    io3.peer_send(unix_server, 20, first_answer());
+    var app3 = App { finished: 1, pool: pg::pool(config("/var/run/postgresql"), 1) };
+    app3.t2.state = pg::TICKET_DONE;
+    route(app3, app3.t1, 1, httpshim::REQUEST, "");
+    httpshim::flush(io3);
+    io3.serve() { io, ev => event(app3, io, ev); };
+    check::that("the query went to the path as it went to an address", find(io3.peer_received(unix_server)[..], "p\0\0\0\x07pw\0") >= 0);
 }

@@ -426,5 +426,7 @@ users, is [architecture](architecture.md).
   that loop's state in globals, which a thread has its own copy of, and queues dials, sends, and
   hang-ups for the host to run on its provider once per event with `httpshim::flush(io)`; the host
   also turns events into the route calls goose-http would have made (`httpshim::next`). The
-  contract's addresses are numeric, so a host name or Unix socket fails the dial. The blocking
-  facade stays on goose-http (2026-11-17).
+  contract's addresses are numeric, so a host name fails the dial, as on goose-http's loop; a
+  host that starts with `/` dials the server's Unix socket on an event loop that supplies
+  goose-io's unix group (contract 0.2), and fails with `BadAddress` on one that does not. The
+  blocking facade stays on goose-http (2026-11-17).

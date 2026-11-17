@@ -477,8 +477,9 @@ The pool's I/O is `http::`: goose-http's sockets, mail, and `wait_socket`. `http
 module `pg.httpshim`, has the same names over [goose-io](https://github.com/BHare1985/goose-io)'s
 contract, so `pool.goose` runs on any provider of it with `httpshim::` where it says `http::`: the
 host passes each event to `httpshim::event`, calls each route that `httpshim::next` gives it, and
-ends with `httpshim::flush(io)` (the header of `httpshim.goose`). Addresses are numeric there, and
-there is one loop per thread.
+ends with `httpshim::flush(io)` (the header of `httpshim.goose`). A host that starts with `/` is a
+Unix socket there too, on an event loop that supplies goose-io's unix group (contract 0.2), and there
+is one loop per thread.
 
 The module `pool.goose`, which a program imports as `pg.pool`, runs single queries on
 goose-http's loop: `serve_epoll`'s, or `serve`'s on io_uring, with

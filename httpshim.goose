@@ -18,7 +18,8 @@
 //   };
 //
 // An exchange is a request of the host's, with a key the host chooses (not 0) and ends with httpshim::end(key).
-// The pool's links carry httpshim::TAG. Addresses are numeric, as the contract's are.
+// The pool's links carry httpshim::TAG. Addresses are numeric, as the contract's are, or `unix:/path` on an event loop
+// that supplies the unix group (a host of the pool that begins with / names the directory of the server's socket).
 namespace httpshim;
 
 import std;
@@ -71,7 +72,7 @@ struct Sock {
     errno: i64,
     link: goose_io::Link,
     waiter: u64,
-    addr: u8[..64],
+    addr: u8[..108],
     out: u8[..SOCK_OUT],
     in_len: i64,
     inbuf: u8[SOCK_IN],
@@ -105,7 +106,9 @@ fn connect_start(where: const u8[:], port: i64) -> Socket, Error {
             s.out.clear();
             s.in_len = 0;
             s.addr.clear();
-            if find(where, ":") >= 0 { format(s.addr, "[", where, "]:", port); } else { format(s.addr, where, ":", port); }
+            if starts_with(where, "unix:") { s.addr.append(where); }
+            else if find(where, ":") >= 0 { format(s.addr, "[", where, "]:", port); }
+            else { format(s.addr, where, ":", port); }
             return Socket { id: i, gen: s.gen }, Error { .. };
         }
     }
@@ -174,17 +177,24 @@ fn mail_send(a: MailAddress, tag: i32, bytes: const u8[:]) -> i64 {
     return SENT;
 }
 
-// The numeric host a Config's route dials: its host, as text.
+// What a Config's route dials: its host, or unix: and the server's socket in the directory a host that starts with /
+// names. cfg is a Config; untyped, so that `goose check` of this file alone takes it.
 fn socket_address(cfg) -> u8[>..] {
     var where: u8[>..] = [];
-    where.append(cfg.host);
+    if cfg.host.len > 0 && cfg.host[0] == '/' {
+        format(where, "unix:", cfg.host, if cfg.host[cfg.host.len - 1] == '/' { "" } else { "/" }, ".s.PGSQL.", cfg.port);
+    } else {
+        where.append(cfg.host);
+    }
     return where;
 }
 
 // Why a connect to where and port failed, for an Error's message.
 fn cant_connect(where: const u8[:], port: i64, e: Error) -> u8[] {
     var message: u8[>..] = [];
-    format(message, "can't connect to ", where, " port ", port, ": ", e.call, " ");
+    format(message, "can't connect to ", where);
+    if !starts_with(where, "unix:") { format(message, " port ", port); }
+    format(message, ": ", e.call, " ");
     if e.code == ECONNREFUSED { message.append("ECONNREFUSED"); }
     else if e.code == ETIMEDOUT { message.append("ETIMEDOUT"); }
     else if e.code == ENOENT { message.append("ENOENT"); }
