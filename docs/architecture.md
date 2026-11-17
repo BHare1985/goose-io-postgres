@@ -474,7 +474,7 @@ What `transaction` doesn't guard against:
 ## The pool
 
 The pool's I/O is `http::`: goose-http's sockets, mail, and `wait_socket`. `httpshim.goose`, the
-module `pg.httpshim`, has the same names over [goose-io](https://github.com/BHare1985/goose-io)'s
+module `pg.httpshim` (and `socketshim.goose`, `pg.socketshim`, which stands where `pg.socket` does for the pool), has the same names over [goose-io](https://github.com/BHare1985/goose-io)'s
 contract, so `pool.goose` runs on any provider of it with `httpshim::` where it says `http::`: the
 host passes each event to `httpshim::event`, calls each route that `httpshim::next` gives it, and
 ends with `httpshim::flush(io)` (the header of `httpshim.goose`). A host that starts with `/` is a

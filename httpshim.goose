@@ -177,31 +177,6 @@ fn mail_send(a: MailAddress, tag: i32, bytes: const u8[:]) -> i64 {
     return SENT;
 }
 
-// What a Config's route dials: its host, or unix: and the server's socket in the directory a host that starts with /
-// names. cfg is a Config; untyped, so that `goose check` of this file alone takes it.
-fn socket_address(cfg) -> u8[>..] {
-    var where: u8[>..] = [];
-    if cfg.host.len > 0 && cfg.host[0] == '/' {
-        format(where, "unix:", cfg.host, if cfg.host[cfg.host.len - 1] == '/' { "" } else { "/" }, ".s.PGSQL.", cfg.port);
-    } else {
-        where.append(cfg.host);
-    }
-    return where;
-}
-
-// Why a connect to where and port failed, for an Error's message.
-fn cant_connect(where: const u8[:], port: i64, e: Error) -> u8[] {
-    var message: u8[>..] = [];
-    format(message, "can't connect to ", where);
-    if !starts_with(where, "unix:") { format(message, " port ", port); }
-    format(message, ": ", e.call, " ");
-    if e.code == ECONNREFUSED { message.append("ECONNREFUSED"); }
-    else if e.code == ETIMEDOUT { message.append("ETIMEDOUT"); }
-    else if e.code == ENOENT { message.append("ENOENT"); }
-    else { format(message, "error ", e.code); }
-    return str(message);
-}
-
 // --- what the host calls ------------------------------------------------------------------------------------
 
 // Takes in an event: the clock and the timers that are due, and the sockets' news. True if it was the pool's.

@@ -26,6 +26,7 @@ namespace pg;
 import std;
 import hash from "github.com/kaitk/goose-hash@v0.0.4";
 import .httpshim;
+import .socketshim;
 
 // Each connection's buffer: the most one query's answer may take, and so
 // the longest message a pooled connection accepts.
@@ -375,9 +376,9 @@ fn drive<R, W>(p: Pool&, t: Ticket&, out: httpshim::Reply, ms: i64, sql: const u
     let s .= p.slots[t.conn];
     loop {
         if s.phase == SLOT_CLOSED {
-            let where = httpshim::socket_address(p.cfg);
+            let where = socket_address(p.cfg);
             let sock, e = httpshim::connect_start(where, p.cfg.port);
-            guard e.code == 0 else { return down(p, t, SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION, httpshim::cant_connect(where, p.cfg.port, e)); }
+            guard e.code == 0 else { return down(p, t, SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION, cant_connect(where, p.cfg.port, e)); }
             s.s = sock;
             s.phase = SLOT_CONNECTING;
             return wait(p, t, out, httpshim::WRITABLE, ms);
@@ -386,8 +387,8 @@ fn drive<R, W>(p: Pool&, t: Ticket&, out: httpshim::Reply, ms: i64, sql: const u
             let e = httpshim::connected(s.s);
             if e.code == httpshim::EINPROGRESS { return wait(p, t, out, httpshim::WRITABLE, ms); }
             guard e.code == 0 else {
-                let where = httpshim::socket_address(p.cfg);
-                return down(p, t, SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION, httpshim::cant_connect(where, p.cfg.port, e));
+                let where = socket_address(p.cfg);
+                return down(p, t, SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION, cant_connect(where, p.cfg.port, e));
             }
             var nonce: u8[18] = [0; 18];
             hash::random_bytes(nonce);
