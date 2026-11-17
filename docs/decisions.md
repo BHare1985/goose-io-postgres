@@ -419,3 +419,16 @@ users, is [architecture](architecture.md).
   ring and on IOCP, `wait_socket` fails with `ENOSYS`, and every pooled query fails
   with that reason. The module is `pg.pool`, beside `pg.socket`, which it imports
   for the server's address (2026-10-23, task 005).
+- **A pool for goose-io's contract is a goose-io library, in its own module.**
+  `pg.iopool` follows the shape goose-io's `docs/libraries.md` gives: one state struct
+  the host owns and one `io_event` entry point that checks its own tag, with no
+  callback stored and no provider named. It is a separate module, and not a port of
+  `pg.pool`, because goose-http's pool is built on `wait_socket` and mail, which the
+  contract has no counterpart for; the facade and the protocol are unchanged, so the
+  blocking facade still runs on goose-http's socket. A query is submitted, its rows go
+  to the host's block as they arrive, and its end is taken with `io_take`. The rows
+  are not held until the answer is whole, as `pg.pool` holds them, so a query that fails
+  after some rows has given those; the contract's `Data` is lent, and holding the answer
+  would need a buffer per connection of the same size anyway. Each query is the unnamed
+  statement, so a connection keeps no statements to track; prepared statements, and
+  pipelining on a connection, wait for a need (2026-11-17).

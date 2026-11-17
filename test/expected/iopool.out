@@ -1,0 +1,19 @@
+-- two queries on one connection
+the first query is queued: ok
+query 1 row: 1 one
+query 1 row: 2 two
+query 1: 2 rows
+the second query is queued: ok
+query 2: failed 42601 syntax error
+the password went in cleartext: ok
+the first query's parameter went as text: ok
+the pool opened one connection for two queries: ok
+-- a server that refuses
+the query is queued: ok
+query 1: failed 08001 can't connect to 10.0.0.6:5432
+nothing is left running: ok
+-- what io_submit refuses
+SQL longer than IO_SQL: ok
+SQL with a NUL byte: ok
+parameters longer than IO_PARAMS: ok
+queries held at once: 128

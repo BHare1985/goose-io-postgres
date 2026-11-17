@@ -30,6 +30,7 @@ per worker, runs single queries for a route without a lane, as HttpArena's
 | 🟡 | Queries in parallel | Several queries in one round trip on the facade (task 003). |
 | 🟢 | goose-http's blocking socket as the facade's transport | The module `pg.socket`: `pg::open` over TCP or a Unix socket, with a time limit on each wait. |
 | 🟡 | A pool | The module `pg.pool`: a pool per worker on goose-http's loop, `serve_epoll`'s or io_uring's, opened as requests need it, with a queue for requests that find no idle connection and reconnects after failures. Tested live on macOS; the Plod program for HttpArena's `/async-db` and its measurement are next (task 005). |
+| 🟡 | A pool on goose-io's contract | The module `pg.iopool`: a goose-io library, so it runs on any provider of that contract. Queries are submitted and their rows go to a block as they arrive; one query at a time per connection, as the unnamed statement. Tested against goose-io's in-memory provider (`test/io/`); not yet against a real provider or server. |
 | 🔴 | TLS | Through goose-tls's client mode, for servers that ask for it. Until then a URL with `sslmode=require`, `verify-ca`, or `verify-full` is refused. |
 | 🔴 | More types | Floats, `numeric`, dates and times, `uuid`, and arrays; `pg::bytes` gives their raw bytes. |
 

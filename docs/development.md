@@ -105,6 +105,12 @@ The areas:
   and the `Bind` that `execute` refuses past them (`params`); and a transaction whose
   connection is lost in its block, or whose `COMMIT` can't be sent
   (`transaction_broken`).
+- `test/io/`: the pool on goose-io's contract (`iopool.goose`), on goose-io's in-memory
+  provider against a server scripted by time: a cleartext login, a query with a
+  parameter and two rows, a second query on the same connection that fails, a refused
+  dial, and what `io_submit` refuses. The test imports goose-io by a path (`../../../..`,
+  a checkout of it beside `.implementations/`); a program of its own declares goose-io at
+  a release.
 - `test/compile/`: `// error:` fixtures, programs that must not compile: a facade call
   outside `pg::run`, `pg::fail` and a `pg::transaction` outside one, a query inside another's row
   block, and a program that imports `pg.socket` without declaring goose-http.

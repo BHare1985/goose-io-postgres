@@ -542,6 +542,53 @@ What a call does, by the request's place:
   `CLOSED`. One that doesn't, as a Plod route can't yet, leaves it to the next
   request that finds none idle, which drops the answer to the query before its own.
 
+## The pool on goose-io's contract
+
+The module `pg.iopool` is the same idea for a program whose loop is any provider of
+[goose-io](https://github.com/BHare1985/goose-io)'s I/O contract, not goose-http's. It
+is a goose-io library: a state struct, `pg::IoPool`, and one entry point,
+`pg::io_event`, that the host calls with every event and that returns whether the
+event was its own. It imports the contract and no provider, and a program that imports
+it declares goose-io in its root file. It has no mail, no `wait_socket`, and no
+Ticket in the route's state: queries are submitted and their results taken.
+
+```goose
+var db = pg::io_pool(cfg, TAG, 4);                 // before serve
+let id = pg::io_submit(db, io, "SELECT id, name FROM items WHERE id < $1", 5000) { w =>
+    pg::param(w, 42);
+};                                                 // 0: refused
+io.serve() { io, ev =>
+    db.io_event(io, ev) { id, r => ... pg::int(r, 0), pg::text(r, 1) ... };
+    loop {
+        let done = db.io_take();                   // oldest ended query first
+        if !done.found { break; }                  // done.id, .failed, .rows, .code, .message
+    }
+};
+```
+
+- `pg::io_pool(cfg, tag, size, connect_ms = 5000)`: up to `size` (at most `IO_SLOTS`,
+  16) connections, none open yet. Its links carry `tag`; each is opened as queries
+  need one.
+- `pg::io_submit(db, io, sql, ms) -> u32`, with a block that writes the parameters
+  with `pg::param(w, v)`, as the facade's `query` takes them. `ms` limits the query from
+  this call to its end, 0 for no limit. The query waits for an idle connection, and a
+  connection is dialled when one waits and none is coming. Returns the id, or 0 when
+  `IO_REQUESTS` (128) queries are held (queued, running, or ended and not taken), the
+  loop is draining, the SQL is over `IO_SQL` (1,024) bytes or holds a NUL byte, or the
+  parameters take over `IO_PARAMS` (1,024) bytes.
+- `pg::io_event(db, io, ev) { id, r => ... }`: row by row, as they arrive, the block
+  gets `id` and a `pg::Row`, valid only inside it. A query that fails after some rows has
+  given those.
+- `pg::io_take(db) -> IoResult`: `failed`, the SQLSTATE in `code` and the reason in
+  `message`, or `rows` for a query that ended.
+
+A connection runs one query at a time, as the unnamed statement, and each message may
+take up to `IO_INPUT` (65,536) bytes. The address is numeric, as the contract's are: a
+host name or a Unix socket path fails the query with `"08001"`, and so does a dial that
+fails. A query that runs past its time, or whose connection the server ends, fails with
+`"08006"` and the connection is reset. While the loop is stopping, the idle sessions are
+ended, the queries that wait fail with `"57P01"`, and none is accepted.
+
 ## Authentication
 
 The server chooses, and `step` answers:
