@@ -419,15 +419,12 @@ users, is [architecture](architecture.md).
   ring and on IOCP, `wait_socket` fails with `ENOSYS`, and every pooled query fails
   with that reason. The module is `pg.pool`, beside `pg.socket`, which it imports
   for the server's address (2026-10-23, task 005).
-- **The pool runs on goose-io's contract, with `pg::pool` and `pg::query` as they
-  were.** goose-http's `recv`, `send`, `connect_start`, and `hangup` act on the loop
-  they run in, with no argument for it, and goose-io's operations take the provider, so
-  the pool takes `io` where it took `out, kind, data`, and cannot sit on a shim of
-  `http::` that leaves its source alone. goose-io pushes events, so `pg::pool_event`
-  takes each one into its connection's buffer, and the route calls `pg::query` at every
-  event, as it called it at every wake. goose-http's mail and `later` have no
-  counterpart: the queue of waiting requests keeps their keys and times in the pool,
-  hands a connection over by making that request its owner, and a wait is renewed only
-  by events of the request's own connection. Addresses are numeric. The blocking
-  facade stays on goose-http's socket: the contract has no blocking receive, and
-  `serve` cannot be run for one read (2026-11-17).
+- **goose-io compatibility is a shim of the `http::` calls, not a change to the pool.**
+  `httpshim.goose` has the names `pool.goose` uses from goose-http (sockets, mail, `later`,
+  `wait_socket`) and implements them over goose-io's contract, so the pool's source differs only
+  in `httpshim::` for `http::`. goose-http's calls act on the loop they run in, so the shim keeps
+  that loop's state in globals, which a thread has its own copy of, and queues dials, sends, and
+  hang-ups for the host to run on its provider once per event with `httpshim::flush(io)`; the host
+  also turns events into the route calls goose-http would have made (`httpshim::next`). The
+  contract's addresses are numeric, so a host name or Unix socket fails the dial. The blocking
+  facade stays on goose-http (2026-11-17).

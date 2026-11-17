@@ -1,17 +1,18 @@
-// A pool of connections on a goose-io loop, for a route that runs one
-// query and answers from its rows (docs/architecture.md, "The pool"). Each
-// loop keeps a Pool of its own. A request that finds no idle connection opens
-// one, up to the pool's size, or polls for one at each of its calls. A program
-// imports the module pg.pool, and declares goose-io in its root file.
+// A pool of connections on goose-http's loop, for a route that runs one
+// query and answers from its rows, as HttpArena's /async-db does
+// (docs/architecture.md, "The pool"). Each worker keeps a Pool of its own:
+// the worker whose exchange waits on a socket owns it. A request that finds
+// no idle connection opens one, up to the pool's size, or waits in a queue
+// until one is handed back. A program imports the module pg.pool, and
+// declares goose-http in its root file at the reference this file names.
 //
-//   import goose_io from "github.com/BHare1985/goose-io@<tag>";
+//   import http from "github.com/kaitk/goose-http@v0.5.16";
 //   import pg.pool;
 //
-//   var db = pg::pool(cfg, per_loop, TAG);     // before serve; TAG is the pool's tag
-//   // in the loop's handler, once per event:
-//   pg::pool_event(db, io, ev);
-//   // then, for each request in flight, at every event, Tick included:
-//   let n = pg::query(db, st.ticket, io, 5000, sql, lo, hi) { r =>
+//   var db = pg::pool(cfg, per_worker);        // in the worker, before serve
+//   // the request's state holds a pg::Ticket { .. }, and at each of the
+//   // route's events, REQUEST, WAKE, TIMEOUT, and CLOSED:
+//   let n = pg::query(db, st.ticket, out, ev.kind, ev.data, 5000, sql, lo, hi) { r =>
 //       ... pg::int(r, 0), pg::text(r, 1) ...
 //   };
 //   if n == pg::WAITS { return; }              // called again at the next event
@@ -23,26 +24,29 @@
 namespace pg;
 
 import std;
-import goose_io;
 import hash from "github.com/kaitk/goose-hash@v0.0.4";
+import .httpshim;
 
 // Each connection's buffer: the most one query's answer may take, and so
 // the longest message a pooled connection accepts.
 let POOL_INPUT = 65536;
-// The most requests that wait for a connection on one loop at once.
+// The most requests that wait for a connection on one worker at once.
 let POOL_WAITERS = 1024;
-
-// The code of a request that found every connection busy and the queue full,
-// Postgres's too_many_connections.
-let TOO_MANY_CONNECTIONS = "53300";
+// The tag of the mail that hands a connection to a request that waits for
+// one; its bytes are the connection's number.
+let POOL_TAG: i32 = 0x7067;
 
 // What query returns, besides a count of rows.
 let WAITS = -1;   // the exchange waits: return from the handler
 let FAILS = -2;   // no answer: Ticket.code and Pool.reason say why
 
+// The code of a request that found every connection busy and the queue full,
+// Postgres's too_many_connections.
+let TOO_MANY_CONNECTIONS = "53300";
+
 // A connection's phases.
 let SLOT_CLOSED: u8 = 0;
-let SLOT_CONNECTING: u8 = 1;   // dialled; Opened not yet seen
+let SLOT_CONNECTING: u8 = 1;   // connect_start's connect going on
 let SLOT_STARTING: u8 = 2;     // the startup message sent; authenticating
 let SLOT_OPEN: u8 = 3;
 
@@ -60,33 +64,22 @@ struct Ticket {
     first: i64 = -1,
     parse: i64 = -1,
     statement: i64 = -1,
-    // The request's number in the pool, the limit on each wait, when the
-    // current wait ends in the loop's clock (0: never), and the activity of
-    // its connection that wait began at.
-    key: u32 = 0,
-    ms: i64 = 0,
-    deadline: i64 = 0,
-    seen: i64 = 0,
+    // The exchange's address, which owns the connection or waits in the queue.
+    addr: httpshim::MailAddress = httpshim::MailAddress { .. },
     // Why query returned FAILS: a SQLSTATE, the server's or one of the
     // facade's codes.
     code: u8[..5],
 }
 
-// A connection of the pool. owner is the key of the request that drives it,
-// 0 for none: idle when open, free to connect when closed. A connection whose
-// owner gave up, as after its time ran out, is adopted by the next request
-// that finds none idle, which reads and drops the answers to queries it
-// didn't send.
+// A connection of the pool. owner is the address of the exchange that drives
+// it, key 0 for none: idle when open, free to connect when closed. A
+// connection whose owner no longer waits, as after a TIMEOUT or CLOSED the
+// program didn't pass on, is adopted by the next request that finds none
+// idle, which reads and drops the answers to queries it didn't send.
 struct Slot {
-    link: goose_io::Link = goose_io::Link { .. },
+    s: httpshim::Socket = httpshim::Socket { .. },
     phase: u8 = SLOT_CLOSED,
-    // Opened has been delivered; Closed has been, or the buffer overflowed.
-    up: bool = false,
-    eof: bool = false,
-    owner: u32 = 0,
-    until: i64 = 0,
-    // How many events the connection has had, so a wait is renewed only by its own.
-    seen: i64 = 0,
+    owner: httpshim::MailAddress = httpshim::MailAddress { .. },
     // Bit k: the pool's statement k is prepared on this connection.
     prepared: u64 = 0,
     // input[at..len] holds what has arrived and step hasn't read.
@@ -96,116 +89,90 @@ struct Slot {
     input: u8[POOL_INPUT],
 }
 
-// A request waiting for a connection: its key, and when it gives up.
-struct Waiter { key: u32 = 0, until: i64 = 0 }
-
-// A loop's connections, with the settings to open them, the statements
-// prepared on them by name, and the requests waiting for one. Build it in the
-// thread that serves, with pool, and keep it last in that thread's state: the
-// connections end it.
+// A worker's connections, with the settings to open them, the statements
+// prepared on them by name, and the requests waiting for one. Build it in
+// the worker that serves, with pool, and keep it last in the worker's state:
+// the connections end it.
 struct Pool {
     cfg: Config,
-    tag: u16 = 1,
-    next_key: u32 = 1,
     // Statement k is named "gp<k>"; its SQL is sql[ends[k - 1]..ends[k]].
     statements: i64 = 0,
     ends: i32[STATEMENTS],
     sql: u8[..STATEMENT_TEXT],
-    // A ring of the requests waiting, from waiters[head].
+    // A ring of the addresses of the requests waiting, from waiters[head].
     head: i64 = 0,
     waiting: i64 = 0,
-    waiters: Waiter[POOL_WAITERS],
+    waiters: httpshim::MailAddress[POOL_WAITERS],
     // Why the last query that failed did.
     reason: u8[..120],
     slots: Slot[>..],
 }
 
 // A pool of size connections, at least one, to cfg's server, none open yet:
-// each opens when a request needs it, and its links carry tag. A pooled
-// connection takes messages up to POOL_INPUT - 1 bytes, or cfg.max_message if
-// lower. The host is a numeric address, as goose-io's are: a name fails.
-fn pool(cfg: Config, size: i64, tag: u16 = 1) -> Pool {
-    var p = Pool { cfg: cfg, tag: tag, .. };
+// each opens when a request needs it. A pooled connection takes messages up
+// to POOL_INPUT - 1 bytes, or cfg.max_message if lower. A host that starts
+// with / is the directory of the server's Unix socket, as for pg::open; a
+// host name fails: goose-http's loop doesn't resolve names.
+fn pool(cfg: Config, size: i64) -> Pool {
+    var p = Pool { cfg: cfg, .. };
     p.cfg.max_message = min(cfg.max_message, POOL_INPUT - 1);
     for i in max(size, 1) { p.slots.push(Slot { c: Conn { .. }, .. }); }
     return p;
 }
 
-// Takes what the loop delivers for the pool's connections into their buffers:
-// call it once for each event, before the requests' queries. True if the event
-// was the pool's.
-fn pool_event<Io>(p: Pool&, io: Io&, ev: goose_io::Event) -> bool {
-    guard goose_io::is_link_event(ev) && goose_io::tag_of(ev) == p.tag else { return false; }
-    let user = goose_io::user_of(ev);
-    guard user >= 1 && user <= p.slots.len else { return true; }
-    let s .= p.slots[user - 1];
-    guard goose_io::same(s.link, goose_io::link_of(ev)) else { return true; }
-    s.seen++;
-    match ev {
-        Opened e => { s.up = true; },
-        Closed e => { s.eof = true; },
-        Data e => {
-            if s.len + e.bytes.len > POOL_INPUT { compact(s); }
-            if s.len + e.bytes.len > POOL_INPUT {
-                s.eof = true;
-                io.reset(s.link);
-            } else {
-                for i in e.bytes.len { s.input[s.len + i] = e.bytes[i]; }
-                s.len += e.bytes.len;
-            }
-        },
-        _ => {},
-    }
-    return true;
-}
-
-// Ends each open session and closes every link, when the loop is stopping.
-fn close<Io>(p: Pool&, io: Io&) {
+// Ends each open session and closes every socket, when the worker's loop has
+// returned.
+fn close(p: Pool&) {
     for k in p.slots.len {
         let s .= p.slots[k];
-        if s.phase == SLOT_OPEN && !s.eof {
+        if s.phase == SLOT_OPEN {
             var out: u8[>..] = [];
             terminate(out);
-            io.send(s.link, out);
+            let n = httpshim::send(s.s, out);
         }
-        hang_up(s, io);
-        s.owner = 0;
+        hang_up(s);
+        s.owner = httpshim::MailAddress { .. };
     }
 }
 
 // Runs sql on a connection of p for the request t belongs to, with up to
 // eight parameters as the facade's query takes them, and calls F with each
-// row, in the text format. Call it at the route's request and at every later
-// event: it connects, waits for a connection, sends, and reads as each event
-// allows, and returns WAITS while the exchange waits, the count of rows once
-// F has seen them all, or FAILS. ms limits the whole query, from its first
-// call; 0 is no limit. When the time runs out it gives up the connection and
-// returns FAILS.
-fn query<F>(p: Pool&, t: Ticket&, io, ms: i64, sql: const u8[:]) -> i64 {
-    return pooled(p, t, io, ms, sql, F) { w => };
+// row, in the text format. Call it at the route's request and at each of
+// its later events, kind and data being the event's (httpshim::Event.kind and
+// .data): it connects, waits for a connection, sends, and reads as each
+// event allows, and returns WAITS while the exchange waits, the count of
+// rows once F has seen them all, or FAILS. ms limits each wait. At TIMEOUT
+// or CLOSED it gives up the connection and returns FAILS.
+fn query<F>(p: Pool&, t: Ticket&, out: httpshim::Reply, kind: u8, data: const u8[:], ms: i64,
+            sql: const u8[:]) -> i64 {
+    return pooled(p, t, out, kind, data, ms, sql, F) { w => };
 }
 
-fn query<F>(p: Pool&, t: Ticket&, io, ms: i64, sql: const u8[:], p1) -> i64 {
-    return pooled(p, t, io, ms, sql, F) { w => param(w, p1); };
+fn query<F>(p: Pool&, t: Ticket&, out: httpshim::Reply, kind: u8, data: const u8[:], ms: i64,
+            sql: const u8[:], p1) -> i64 {
+    return pooled(p, t, out, kind, data, ms, sql, F) { w => param(w, p1); };
 }
 
-fn query<F>(p: Pool&, t: Ticket&, io, ms: i64, sql: const u8[:], p1, p2) -> i64 {
-    return pooled(p, t, io, ms, sql, F) { w =>
+fn query<F>(p: Pool&, t: Ticket&, out: httpshim::Reply, kind: u8, data: const u8[:], ms: i64,
+            sql: const u8[:], p1, p2) -> i64 {
+    return pooled(p, t, out, kind, data, ms, sql, F) { w =>
         param(w, p1);
         param(w, p2);
     };
 }
 
-fn query<F>(p: Pool&, t: Ticket&, io, ms: i64, sql: const u8[:], p1, p2, p3) -> i64 {
-    return pooled(p, t, io, ms, sql, F) { w =>
+fn query<F>(p: Pool&, t: Ticket&, out: httpshim::Reply, kind: u8, data: const u8[:], ms: i64,
+            sql: const u8[:], p1, p2, p3) -> i64 {
+    return pooled(p, t, out, kind, data, ms, sql, F) { w =>
         param(w, p1);
         param(w, p2);
         param(w, p3);
     };
 }
 
-fn query<F>(p: Pool&, t: Ticket&, io, ms: i64, sql: const u8[:], p1, p2, p3, p4) -> i64 {
-    return pooled(p, t, io, ms, sql, F) { w =>
+fn query<F>(p: Pool&, t: Ticket&, out: httpshim::Reply, kind: u8, data: const u8[:], ms: i64,
+            sql: const u8[:], p1, p2, p3, p4) -> i64 {
+    return pooled(p, t, out, kind, data, ms, sql, F) { w =>
         param(w, p1);
         param(w, p2);
         param(w, p3);
@@ -213,8 +180,9 @@ fn query<F>(p: Pool&, t: Ticket&, io, ms: i64, sql: const u8[:], p1, p2, p3, p4)
     };
 }
 
-fn query<F>(p: Pool&, t: Ticket&, io, ms: i64, sql: const u8[:], p1, p2, p3, p4, p5) -> i64 {
-    return pooled(p, t, io, ms, sql, F) { w =>
+fn query<F>(p: Pool&, t: Ticket&, out: httpshim::Reply, kind: u8, data: const u8[:], ms: i64,
+            sql: const u8[:], p1, p2, p3, p4, p5) -> i64 {
+    return pooled(p, t, out, kind, data, ms, sql, F) { w =>
         param(w, p1);
         param(w, p2);
         param(w, p3);
@@ -223,8 +191,9 @@ fn query<F>(p: Pool&, t: Ticket&, io, ms: i64, sql: const u8[:], p1, p2, p3, p4,
     };
 }
 
-fn query<F>(p: Pool&, t: Ticket&, io, ms: i64, sql: const u8[:], p1, p2, p3, p4, p5, p6) -> i64 {
-    return pooled(p, t, io, ms, sql, F) { w =>
+fn query<F>(p: Pool&, t: Ticket&, out: httpshim::Reply, kind: u8, data: const u8[:], ms: i64,
+            sql: const u8[:], p1, p2, p3, p4, p5, p6) -> i64 {
+    return pooled(p, t, out, kind, data, ms, sql, F) { w =>
         param(w, p1);
         param(w, p2);
         param(w, p3);
@@ -234,8 +203,9 @@ fn query<F>(p: Pool&, t: Ticket&, io, ms: i64, sql: const u8[:], p1, p2, p3, p4,
     };
 }
 
-fn query<F>(p: Pool&, t: Ticket&, io, ms: i64, sql: const u8[:], p1, p2, p3, p4, p5, p6, p7) -> i64 {
-    return pooled(p, t, io, ms, sql, F) { w =>
+fn query<F>(p: Pool&, t: Ticket&, out: httpshim::Reply, kind: u8, data: const u8[:], ms: i64,
+            sql: const u8[:], p1, p2, p3, p4, p5, p6, p7) -> i64 {
+    return pooled(p, t, out, kind, data, ms, sql, F) { w =>
         param(w, p1);
         param(w, p2);
         param(w, p3);
@@ -246,8 +216,9 @@ fn query<F>(p: Pool&, t: Ticket&, io, ms: i64, sql: const u8[:], p1, p2, p3, p4,
     };
 }
 
-fn query<F>(p: Pool&, t: Ticket&, io, ms: i64, sql: const u8[:], p1, p2, p3, p4, p5, p6, p7, p8) -> i64 {
-    return pooled(p, t, io, ms, sql, F) { w =>
+fn query<F>(p: Pool&, t: Ticket&, out: httpshim::Reply, kind: u8, data: const u8[:], ms: i64,
+            sql: const u8[:], p1, p2, p3, p4, p5, p6, p7, p8) -> i64 {
+    return pooled(p, t, out, kind, data, ms, sql, F) { w =>
         param(w, p1);
         param(w, p2);
         param(w, p3);
@@ -265,96 +236,98 @@ struct Binding { out: u8[>..]&, b: Bind }
 fn param(w: Binding, v) { param(w.out, w.b, v); }
 
 // query's work, with R the rows' block and W the writer of the parameters.
-fn pooled<R, W>(p: Pool&, t: Ticket&, io, ms: i64, sql: const u8[:]) -> i64 {
-    if (t.state == TICKET_QUEUED || t.state == TICKET_HAVE) && t.deadline != 0 && io.now_ms() >= t.deadline {
+fn pooled<R, W>(p: Pool&, t: Ticket&, out: httpshim::Reply, kind: u8, data: const u8[:], ms: i64,
+                sql: const u8[:]) -> i64 {
+    if kind == httpshim::TIMEOUT || kind == httpshim::CLOSED {
         if t.state == TICKET_HAVE && owns(p, t) {
-            // A server that doesn't answer in time may not answer at all.
-            hang_up(p.slots[t.conn], io);
-            release(p, io, t.conn);
+            // A server that doesn't answer in time may not answer at all;
+            // a client that went leaves a connection the next owner reads on.
+            if kind == httpshim::TIMEOUT { hang_up(p.slots[t.conn]); }
+            release(p, t.conn);
         }
-        return fails(p, t, CONNECTION_FAILURE, "the database didn't answer in time");
+        let timed_out = kind == httpshim::TIMEOUT;
+        return fails(p, t, CONNECTION_FAILURE,
+                     if timed_out { "the database didn't answer in time" } else { "the client went" });
     }
     if t.state == TICKET_QUEUED {
-        var k = -1;
-        for i in p.slots.len { if p.slots[i].owner == t.key { k = i; } }
-        guard k >= 0 else { return WAITS; }
+        guard kind == httpshim::WAKE else { return WAITS; }
+        let k = handed(data);
+        // Other mail leaves t in the queue, where it is.
+        guard k >= 0 && k < p.slots.len && p.slots[k].owner.key == t.addr.key else {
+            httpshim::later(out, ms);
+            return WAITS;
+        }
         t.state = TICKET_HAVE;
         t.conn = k;
-        t.seen = p.slots[k].seen;
     }
     if t.state == TICKET_NEW {
         guard !has_nul(sql) else { return fails(p, t, CHARACTER_NOT_IN_REPERTOIRE, "the SQL holds a NUL byte"); }
-        t.key = p.next_key;
-        p.next_key = if p.next_key == 0xffffffff { 1 } else { p.next_key + 1 };
-        t.ms = ms;
-        t.deadline = if ms > 0 { io.now_ms() + ms } else { 0 };
-        let r = acquire(p, t, io);
+        let r = acquire(p, t, out, ms);
         guard r == 0 else { return r; }
     }
     guard t.state == TICKET_HAVE else { return fails(p, t, CONNECTION_DOES_NOT_EXIST, "the query has ended"); }
-    return drive(p, t, io, ms, sql, R, W);
+    return drive(p, t, out, ms, sql, R, W);
 }
 
-// Gives t a connection: an idle open one, then one without an owner to open,
-// then one whose owner's time has run out, which goes to the queue's first
-// request when there is one; or queues t, or fails when the queue is full.
-// 0 when t has one.
-fn acquire<Io>(p: Pool&, t: Ticket&, io: Io&) -> i64 {
-    let now = io.now_ms();
+// Gives t a connection: an idle open one, then one without an owner to open
+// or to go on opening, then one whose owner no longer waits, which goes to
+// the queue's first request when there is one; or queues t, or fails when
+// the queue is full. 0 when t has one.
+fn acquire(p: Pool&, t: Ticket&, out: httpshim::Reply, ms: i64) -> i64 {
+    let me = httpshim::later(out, ms);
+    t.addr = me;
     loop {
         var idle = -1;
         var unowned = -1;
         var abandoned = -1;
         for k in p.slots.len {
             let s .= p.slots[k];
-            if s.owner == 0 {
+            if s.owner.key == 0 {
                 if s.phase == SLOT_OPEN {
                     idle = k;
                     break;
                 }
                 if unowned < 0 { unowned = k; }
-            } else if abandoned < 0 && s.until != 0 && now >= s.until {
+            } else if abandoned < 0 && !httpshim::mail_live(s.owner) {
                 abandoned = k;
             }
         }
         if idle < 0 && unowned < 0 && abandoned >= 0 && p.waiting > 0 {
             // Leaves it with a waiter, or with no owner if none still waits.
-            release(p, io, abandoned);
+            release(p, abandoned);
             continue;
         }
-        // An idle connection while requests wait is one that no one took yet:
-        // it goes to the queue.
+        // An idle connection while requests wait is one a full box kept from
+        // the first of them: it goes to the queue, unless the box is still full.
         if idle >= 0 && p.waiting > 0 {
-            release(p, io, idle);
-            if p.slots[idle].owner != 0 { continue; }
+            release(p, idle);
+            if p.slots[idle].owner.key != 0 { continue; }
         }
         let k = if idle >= 0 { idle } else if unowned >= 0 { unowned } else { abandoned };
         guard k < 0 else {
-            p.slots[k].owner = t.key;
-            p.slots[k].until = t.deadline;
+            p.slots[k].owner = me;
             t.state = TICKET_HAVE;
             t.conn = k;
-            t.seen = p.slots[k].seen;
             return 0;
         }
         break;
     }
-    if p.waiting == POOL_WAITERS { forget_gone_waiters(p, now); }
+    if p.waiting == POOL_WAITERS { forget_gone_waiters(p); }
     guard p.waiting < POOL_WAITERS else {
         return fails(p, t, TOO_MANY_CONNECTIONS, "every connection is busy, and POOL_WAITERS requests wait");
     }
-    p.waiters[(p.head + p.waiting) % POOL_WAITERS] = Waiter { key: t.key, until: t.deadline };
+    p.waiters[(p.head + p.waiting) % POOL_WAITERS] = me;
     p.waiting++;
     t.state = TICKET_QUEUED;
     return WAITS;
 }
 
-// Drops the waiters whose time has run out from p's queue, keeping the order.
-fn forget_gone_waiters(p: Pool&, now: i64) {
+// Drops the waiters that no longer wait from p's queue, keeping the order.
+fn forget_gone_waiters(p: Pool&) {
     var kept = 0;
     for i in p.waiting {
         let w = p.waiters[(p.head + i) % POOL_WAITERS];
-        if w.until == 0 || now < w.until {
+        if httpshim::mail_live(w) {
             p.waiters[(p.head + kept) % POOL_WAITERS] = w;
             kept++;
         }
@@ -362,65 +335,60 @@ fn forget_gone_waiters(p: Pool&, now: i64) {
     p.waiting = kept;
 }
 
-// Whether t still owns its connection.
+// Whether t's exchange still owns its connection.
 fn owns(p: const Pool&, t: const Ticket&) -> bool {
-    return t.conn >= 0 && t.conn < p.slots.len && p.slots[t.conn].owner == t.key;
+    return t.conn >= 0 && t.conn < p.slots.len && p.slots[t.conn].owner.key == t.addr.key;
 }
 
-// Hands connection k to the first request in the queue whose time hasn't run
-// out, or leaves it idle.
-fn release<Io>(p: Pool&, io: Io&, k: i64) {
+// Hands connection k to the first request in the queue that still waits, or
+// leaves it idle.
+fn release(p: Pool&, k: i64) {
     let s .= p.slots[k];
-    s.owner = 0;
-    s.until = 0;
-    let now = io.now_ms();
+    s.owner = httpshim::MailAddress { .. };
+    var number: u8[8] = [0; 8];
+    for i in 8 { number[i] = (k >> (i * 8)) as! u8; }
     while p.waiting > 0 {
         let w = p.waiters[p.head];
+        let sent = httpshim::mail_send(w, POOL_TAG, number);
+        // A full box may take the mail later: w stays first.
+        guard sent != httpshim::FULL else { return; }
         p.head = (p.head + 1) % POOL_WAITERS;
         p.waiting--;
-        if w.until == 0 || now < w.until {
-            s.owner = w.key;
-            s.until = w.until;
+        if sent == httpshim::SENT {
+            s.owner = w;
             return;
         }
     }
 }
 
-// Waits for t's connection to have something new, with t's limit on the wait
-// renewed by the connection's own events, not by the loop's others.
-fn wait<Io>(p: Pool&, t: Ticket&, io: Io&) -> i64 {
-    let s .= p.slots[t.conn];
-    if s.seen != t.seen {
-        t.seen = s.seen;
-        if t.ms > 0 {
-            t.deadline = io.now_ms() + t.ms;
-            s.until = t.deadline;
-        }
-    }
-    return WAITS;
+// The connection's number in the mail that handed it over, or -1.
+fn handed(data: const u8[:]) -> i64 {
+    guard data.len == 8 else { return -1; }
+    var k = 0;
+    for i in 8 { k |= (data[i] as i64) << (i * 8); }
+    return k;
 }
 
 // Drives t's connection as far as it can go without waiting: connects,
 // authenticates, sends the query, and reads its answer.
-fn drive<R, W>(p: Pool&, t: Ticket&, io, ms: i64, sql: const u8[:]) -> i64 {
+fn drive<R, W>(p: Pool&, t: Ticket&, out: httpshim::Reply, ms: i64, sql: const u8[:]) -> i64 {
     let s .= p.slots[t.conn];
     loop {
         if s.phase == SLOT_CLOSED {
-            var where: u8[>..] = [];
-            if find(p.cfg.host[..], ":") >= 0 { format(where, "[", p.cfg.host[..], "]:", p.cfg.port); }
-            else { format(where, p.cfg.host[..], ":", p.cfg.port); }
-            s.link = io.dial(where[..], p.tag, if ms > 0 { ms } else { 0 });
-            io.set_user(s.link, (t.conn + 1) as u32);
-            s.up = false;
-            s.eof = false;
+            let where = httpshim::socket_address(p.cfg);
+            let sock, e = httpshim::connect_start(where, p.cfg.port);
+            guard e.code == 0 else { return down(p, t, SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION, httpshim::cant_connect(where, p.cfg.port, e)); }
+            s.s = sock;
             s.phase = SLOT_CONNECTING;
-            return wait(p, t, io);
+            return wait(p, t, out, httpshim::WRITABLE, ms);
         }
         if s.phase == SLOT_CONNECTING {
-            if s.eof {
-                return down(p, t, io, SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION, "can't connect to the database");
+            let e = httpshim::connected(s.s);
+            if e.code == httpshim::EINPROGRESS { return wait(p, t, out, httpshim::WRITABLE, ms); }
+            guard e.code == 0 else {
+                let where = httpshim::socket_address(p.cfg);
+                return down(p, t, SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION, httpshim::cant_connect(where, p.cfg.port, e));
             }
-            guard s.up else { return wait(p, t, io); }
             var nonce: u8[18] = [0; 18];
             hash::random_bytes(nonce);
             var o: u8[>..] = [];
@@ -428,42 +396,42 @@ fn drive<R, W>(p: Pool&, t: Ticket&, io, ms: i64, sql: const u8[:]) -> i64 {
             s.at = 0;
             s.len = 0;
             s.prepared = 0;
-            guard s.c.state != BROKEN else { return down(p, t, io, SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION, s.c.reason); }
-            guard io.send(s.link, o) == goose_io::SendStatus.Sent else { return down(p, t, io, CONNECTION_FAILURE, "sending to the server failed"); }
+            guard s.c.state != BROKEN else { return down(p, t, SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION, s.c.reason); }
+            guard httpshim::send(s.s, o) == o.len else { return down(p, t, CONNECTION_FAILURE, "sending to the server failed"); }
             s.phase = SLOT_STARTING;
-            return wait(p, t, io);
+            return wait(p, t, out, httpshim::READABLE, ms);
         }
-        let open = !s.eof;
+        let open = pull(s);
         if s.phase == SLOT_OPEN && t.first < 0 {
             // A connection the server ended while it was idle is opened
             // again for this query.
             if !open || room(s.c) < 3 || !idle_ok(s) {
-                hang_up(s, io);
+                hang_up(s);
                 continue;
             }
-            return send_query(p, t, io, sql, W);
+            return send_query(p, t, out, ms, sql, W);
         }
         // What arrived before the server closed may say why it did.
         if s.phase == SLOT_STARTING {
             var o: u8[>..] = [];
             let e, body = step(s.c, s.input[s.at..s.len], o);
             s.at += s.c.used;
-            if o.len > 0 && io.send(s.link, o) != goose_io::SendStatus.Sent { return down(p, t, io, CONNECTION_FAILURE, "sending to the server failed"); }
+            if o.len > 0 && httpshim::send(s.s, o) != o.len { return down(p, t, CONNECTION_FAILURE, "sending to the server failed"); }
             if e == READY {
                 s.phase = SLOT_OPEN;
                 continue;
             }
-            if e == FAILED { return lost_slot(p, t, io, body); }
-            if e == WANT_INPUT { return more(p, t, io, open); }
+            if e == FAILED { return lost_slot(p, t, body); }
+            if e == WANT_INPUT { return more(p, t, out, ms, open); }
             continue;
         }
-        return answer(p, t, io, open, R);
+        return answer(p, t, out, ms, open, R);
     }
 }
 
 // Writes t's query, a Parse first when the connection hasn't prepared sql,
 // sends it, and waits for the answer.
-fn send_query<W>(p: Pool&, t: Ticket&, io, sql: const u8[:]) -> i64 {
+fn send_query<W>(p: Pool&, t: Ticket&, out: httpshim::Reply, ms: i64, sql: const u8[:]) -> i64 {
     let s .= p.slots[t.conn];
     var o: u8[>..] = [];
     var name: u8[..24] = [];
@@ -484,13 +452,13 @@ fn send_query<W>(p: Pool&, t: Ticket&, io, sql: const u8[:]) -> i64 {
     let q = execute(s.c, o, b);
     let y = sync(s.c, o);
     // A message longer than MAX_MESSAGE broke the connection: none is sent.
-    guard s.c.state != BROKEN else { return down(p, t, io, CONNECTION_FAILURE, s.c.reason); }
+    guard s.c.state != BROKEN else { return down(p, t, CONNECTION_FAILURE, s.c.reason); }
     if t.first < 0 { t.first = if q >= 0 { q } else { y }; }
     // More than 65535 parameters: the Bind is dropped, and the query fails
     // with this code once the server has answered the rest.
     if q < 0 { t.code.append("54023"); }
-    guard io.send(s.link, o) == goose_io::SendStatus.Sent else { return down(p, t, io, CONNECTION_FAILURE, "sending to the server failed"); }
-    return wait(p, t, io);
+    guard httpshim::send(s.s, o) == o.len else { return down(p, t, CONNECTION_FAILURE, "sending to the server failed"); }
+    return wait(p, t, out, httpshim::READABLE, ms);
 }
 
 fn bit(k: i64) -> u64 { (1 as u64) << k }
@@ -513,25 +481,25 @@ fn pool_statement(p: Pool&, sql: const u8[:]) -> i64 {
 
 // Reads the answers on t's connection: those to queries sent before t's,
 // dropped, then, once t's answer has arrived whole, each of its rows to R.
-fn answer<R>(p: Pool&, t: Ticket&, io, open: bool) -> i64 {
+fn answer<R>(p: Pool&, t: Ticket&, out: httpshim::Reply, ms: i64, open: bool) -> i64 {
     let s .= p.slots[t.conn];
     var count = 0;
     var failed = false;
     var code: u8[..5] = [];
     var message: u8[>..] = [];
     loop {
-        guard s.c.count > 0 else { return down(p, t, io, CONNECTION_FAILURE, "the connection lost track of the query"); }
+        guard s.c.count > 0 else { return down(p, t, CONNECTION_FAILURE, "the connection lost track of the query"); }
         if s.c.next - s.c.count >= t.first && !whole_answer(s) {
             guard s.at > 0 || s.len < POOL_INPUT else {
-                return down(p, t, io, CONNECTION_FAILURE, "the answer is longer than POOL_INPUT");
+                return down(p, t, CONNECTION_FAILURE, "the answer is longer than POOL_INPUT");
             }
-            return more(p, t, io, open);
+            return more(p, t, out, ms, open);
         }
         var o: u8[>..] = [];
         let e, body = step(s.c, s.input[s.at..s.len], o);
         s.at += s.c.used;
-        if e == WANT_INPUT { return more(p, t, io, open); }
-        if e == FAILED { return lost_slot(p, t, io, body); }
+        if e == WANT_INPUT { return more(p, t, out, ms, open); }
+        if e == FAILED { return lost_slot(p, t, body); }
         if e == ERROR && field(body, 'C') == INVALID_SQL_STATEMENT_NAME { s.prepared = 0; }
         guard s.c.seq >= t.first else { continue; }
         if e == ROW {
@@ -551,7 +519,7 @@ fn answer<R>(p: Pool&, t: Ticket&, io, open: bool) -> i64 {
             }
         } else if e == READY {
             compact(s);
-            release(p, io, t.conn);
+            release(p, t.conn);
             if failed { return fails(p, t, code, message); }
             guard t.code.len == 0 else { return fails(p, t, "54023", "more than 65535 parameters, Postgres's limit"); }
             t.state = TICKET_DONE;
@@ -575,18 +543,18 @@ fn idle_ok(s: Slot&) -> bool {
 
 // Waits for more of the answer on t's connection, or, once the server has
 // closed it, fails with the error it sent before, if any.
-fn more(p: Pool&, t: Ticket&, io, open: bool) -> i64 {
+fn more(p: Pool&, t: Ticket&, out: httpshim::Reply, ms: i64, open: bool) -> i64 {
     let s .= p.slots[t.conn];
     if open {
         compact(s);
-        return wait(p, t, io);
+        return wait(p, t, out, httpshim::READABLE, ms);
     }
     loop {
         var o: u8[>..] = [];
         let e, body = step(s.c, s.input[s.at..s.len], o);
         s.at += s.c.used;
-        if e == FAILED { return lost_slot(p, t, io, body); }
-        if e == WANT_INPUT { return down(p, t, io, CONNECTION_FAILURE, "the server closed the connection, or receiving failed"); }
+        if e == FAILED { return lost_slot(p, t, body); }
+        if e == WANT_INPUT { return down(p, t, CONNECTION_FAILURE, "the server closed the connection, or receiving failed"); }
     }
 }
 
@@ -603,6 +571,21 @@ fn whole_answer(s: const Slot&) -> bool {
     return false;
 }
 
+// Reads what the socket holds into s's input, while there is room: false
+// once the server has closed it, or it failed.
+fn pull(s: Slot&) -> bool {
+    loop {
+        if s.len == POOL_INPUT {
+            guard s.at > 0 else { return true; }
+            compact(s);
+        }
+        let n = httpshim::recv(s.s, s.input[s.len..]);
+        if n == -httpshim::EAGAIN { return true; }
+        guard n > 0 else { return false; }
+        s.len += n;
+    }
+}
+
 // Moves what step hasn't read to the front of s's input.
 fn compact(s: Slot&) {
     guard s.at > 0 else { return; }
@@ -612,31 +595,39 @@ fn compact(s: Slot&) {
     s.len = keep;
 }
 
-// Closes s's link, which the next request to take it dials again.
-fn hang_up<Io>(s: Slot&, io: Io&) {
-    if s.phase != SLOT_CLOSED && !s.eof { io.reset(s.link); }
-    s.link = goose_io::Link { .. };
+// Waits for t's connection to be ready for events.
+fn wait(p: Pool&, t: Ticket&, out: httpshim::Reply, events: u32, ms: i64) -> i64 {
+    let e = httpshim::wait_socket(out, p.slots[t.conn].s, events, ms);
+    guard e.code == 0 else {
+        var why: u8[>..] = [];
+        format(why, "wait_socket fails with ", e.code, ": the loop must be serve_epoll's, or serve's on io_uring");
+        return down(p, t, CONNECTION_FAILURE, why);
+    }
+    return WAITS;
+}
+
+// Closes s's socket, which the next request to take it connects again.
+fn hang_up(s: Slot&) {
+    httpshim::hangup(s.s);
     s.phase = SLOT_CLOSED;
-    s.up = false;
-    s.eof = false;
     s.at = 0;
     s.len = 0;
     s.prepared = 0;
 }
 
 // t's connection failed: closes it, hands it on, and fails t.
-fn down<Io>(p: Pool&, t: Ticket&, io: Io&, code: const u8[:], why: const u8[:]) -> i64 {
-    hang_up(p.slots[t.conn], io);
-    release(p, io, t.conn);
+fn down(p: Pool&, t: Ticket&, code: const u8[:], why: const u8[:]) -> i64 {
+    hang_up(p.slots[t.conn]);
+    release(p, t.conn);
     return fails(p, t, code, why);
 }
 
 // t's connection broke in step: with the server's error, when it sent one.
-fn lost_slot<Io>(p: Pool&, t: Ticket&, io: Io&, body: const u8[:]) -> i64 {
+fn lost_slot(p: Pool&, t: Ticket&, body: const u8[:]) -> i64 {
     var why: u8[>..] = [];
     let code = field(body, 'C');
     why.append(if code.len > 0 { field(body, 'M') } else { p.slots[t.conn].c.reason });
-    return down(p, t, io, if code.len > 0 { code } else { CONNECTION_FAILURE }, why);
+    return down(p, t, if code.len > 0 { code } else { CONNECTION_FAILURE }, why);
 }
 
 // Ends t with code and why.

@@ -8,6 +8,7 @@ import goose_io from "../../../..";
 import goose_io.memory;
 import pg from "../../";
 import pg.pool;
+import pg.httpshim;
 import check from "../lib/check/";
 
 // RowDescription for an int4 column "id" and a text column "name".
@@ -75,20 +76,27 @@ fn second_answer() -> u8[>..] {
 
 struct App { t1: pg::Ticket = pg::Ticket { .. }, t2: pg::Ticket = pg::Ticket { .. }, finished: i64 = 0, pool: pg::Pool }
 
-// One request's query at every event, until it ends.
-fn run(app: App&, io: goose_io_memory::Loop&, t: pg::Ticket&, name: const u8[:], sql: const u8[:]) {
+// One request's route: its query at its request and at each wake, until it ends. The exchange's key is 1 or 2.
+fn route(app: App&, t: pg::Ticket&, key: u64, kind: u8, data: const u8[:]) {
     guard t.state != pg::TICKET_DONE else { return; }
-    let n = pg::query(app.pool, t, io, 1000, sql, 3) { r => print(name, " row: ", pg::int(r, 0), " ", pg::text(r, 1)); };
+    let n = pg::query(app.pool, t, httpshim::Reply { key: key }, kind, data, 1000, sql_of(key), 3) { r => print("request ", key, " row: ", pg::int(r, 0), " ", pg::text(r, 1)); };
     if n == pg::WAITS { return; }
-    if n == pg::FAILS { print(name, " failed ", t.code[..], " ", app.pool.reason[..]); }
-    else { print(name, ": ", n, " rows"); }
+    if n == pg::FAILS { print("request ", key, " failed ", t.code[..], " ", app.pool.reason[..]); }
+    else { print("request ", key, ": ", n, " rows"); }
+    httpshim::end(key);
     app.finished++;
 }
 
+fn sql_of(key: u64) -> const u8[:] { return if key == 1 { "SELECT id, name FROM items WHERE id < $1" } else { "SELEC $1" }; }
+
 fn event(app: App&, io: goose_io_memory::Loop&, ev: goose_io::Event) {
-    pg::pool_event(app.pool, io, ev);
-    run(app, io, app.t1, "first", "SELECT id, name FROM items WHERE id < $1");
-    run(app, io, app.t2, "second", "SELEC $1");
+    httpshim::event(io, ev);
+    loop {
+        var w = httpshim::Wake { .. };
+        if !httpshim::next(w) { break; }
+        if w.key == 1 { route(app, app.t1, 1, w.kind, w.data[..]); } else { route(app, app.t2, 2, w.kind, w.data[..]); }
+    }
+    httpshim::flush(io);
     if app.finished == 2 { io.stop(0); }
 }
 
@@ -111,9 +119,10 @@ fn main() {
     io.peer_send(server, 5, login());
     io.peer_send(server, 20, first_answer());
     io.peer_send(server, 40, second_answer());
-    var app = App { pool: pg::pool(config("10.0.0.5"), 1, 7) };
-    run(app, io, app.t1, "first", "SELECT id, name FROM items WHERE id < $1");
-    run(app, io, app.t2, "second", "SELEC $1");
+    var app = App { pool: pg::pool(config("10.0.0.5"), 1) };
+    route(app, app.t1, 1, httpshim::REQUEST, "");
+    route(app, app.t2, 2, httpshim::REQUEST, "");
+    httpshim::flush(io);
     io.serve() { io, ev => event(app, io, ev); };
     let sent = io.peer_received(server);
     check::that("the password went in cleartext", find(sent[..], "p\0\0\0\x07pw\0") >= 0);
@@ -122,8 +131,9 @@ fn main() {
     print("-- a server that refuses");
     var io2 = goose_io_memory::Loop { .. };
     io2.peer_refuse(io2.add_peer(), "10.0.0.6:5432");
-    var app2 = App { finished: 1, pool: pg::pool(config("10.0.0.6"), 2, 7) };
+    var app2 = App { finished: 1, pool: pg::pool(config("10.0.0.6"), 2) };
     app2.t2.state = pg::TICKET_DONE;
-    run(app2, io2, app2.t1, "refused", "SELECT 1");
+    route(app2, app2.t1, 1, httpshim::REQUEST, "");
+    httpshim::flush(io2);
     io2.serve() { io, ev => event(app2, io, ev); };
 }

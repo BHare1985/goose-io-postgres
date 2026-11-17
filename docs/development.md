@@ -43,12 +43,12 @@ because Goose collects a package's symbol table from every `.goose` file under i
 
 ## The goose-http pin
 
-`socket.goose`, the module `pg.socket`, imports
+`socket.goose` and `pool.goose`, the modules `pg.socket` and `pg.pool`, import
 goose-http at its release `v0.5.16` (2026-10-30), the tag Plod pins, so a Plod program
-declares one goose-http. It has the outbound connections' blocking socket.
-`pool.goose`, `pg.pool`, imports goose-io (`github.com/BHare1985/goose-io`), which
-has no release to pin yet; `test/io/` imports a checkout by its path.
-`test/live/socket.goose`, the quick start in `README.md`, and `docs/architecture.md`
+declares one goose-http for both. It has the outbound connections: the blocking
+socket, and `wait_socket` on `serve_epoll`'s loop and on `serve`'s io_uring loop
+(since 2026-10-22, goose-http's task 053). `test/live/socket.goose`,
+`test/live/pool.goose`, the quick start in `README.md`, and `docs/architecture.md`
 declare the same reference. Move them all in one commit, with
 `scripts/test.sh` and `scripts/live.sh` passing. A commit pin, for a fix not yet
 released, is the full 40-hex hash, since git can't fetch an abbreviated one.
@@ -105,9 +105,6 @@ The areas:
   and the `Bind` that `execute` refuses past them (`params`); and a transaction whose
   connection is lost in its block, or whose `COMMIT` can't be sent
   (`transaction_broken`).
-- `test/io/`: the pool on goose-io's in-memory provider against a server scripted by
-  time (`pool_on_goose_io`): a cleartext login, a query with a parameter and two rows,
-  a second query on the same connection that fails, and a refused dial.
 - `test/compile/`: `// error:` fixtures, programs that must not compile: a facade call
   outside `pg::run`, `pg::fail` and a `pg::transaction` outside one, a query inside another's row
   block, and a program that imports `pg.socket` without declaring goose-http.

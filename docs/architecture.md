@@ -21,7 +21,7 @@ Two layers go on top of it:
   supplies. Queries "in parallel", pipelined on one connection, are still to come.
 - **A pool on the worker's loop** ([below](#the-pool)), through the module
   `pg.pool`. A route that runs one query, as HttpArena's `/async-db` does, sends it
-  on a connection of its worker's pool and waits on a goose-io loop,
+  on a connection of its worker's pool and waits on the socket on goose-http's loop,
   then writes the rows into its answer in the call that finds them all.
 
 ## The API
@@ -30,8 +30,8 @@ All of it is in namespace `pg`: `pg.goose` holds the connection, the messages th
 client writes, and `step`; `scram.goose` the authentication; `decode.goose` the
 readers of rows; `url.goose` the settings; `facade.goose` the blocking facade. The
 module `socket.goose`, which a program imports as `pg.socket`, is the facade over
-goose-http's socket, and `pool.goose`, `pg.pool`, the pool on a goose-io loop; the first needs goose-http,
-the second goose-io.
+goose-http's socket, and `pool.goose`, `pg.pool`, the pool on goose-http's loop; they
+are the only parts that need goose-http.
 
 ### Settings
 
@@ -473,72 +473,81 @@ What `transaction` doesn't guard against:
 
 ## The pool
 
+The pool's I/O is `http::`: goose-http's sockets, mail, and `wait_socket`. `httpshim.goose`, the
+module `pg.httpshim`, has the same names over [goose-io](https://github.com/BHare1985/goose-io)'s
+contract, so `pool.goose` runs on any provider of it with `httpshim::` where it says `http::`: the
+host passes each event to `httpshim::event`, calls each route that `httpshim::next` gives it, and
+ends with `httpshim::flush(io)` (the header of `httpshim.goose`). Addresses are numeric there, and
+there is one loop per thread.
+
 The module `pool.goose`, which a program imports as `pg.pool`, runs single queries on
-a [goose-io](https://github.com/BHare1985/goose-io) loop, any provider of its I/O
-contract. The root file declares goose-hash and goose-io. Each loop keeps a `pg::Pool`
-of its own, built before it serves, and each request a `pg::Ticket` in its state. The
-handler gives each event to `pg::pool_event`, then calls `pg::query` for each request
-in flight, at every event, `Tick` included, and the call does what the state allows:
+goose-http's loop: `serve_epoll`'s, or `serve`'s on io_uring, with
+`Config.mail_slots` and `Config.max_waiting` set, since the pool waits as `later`
+does. The root file declares goose-hash and goose-http, as for `pg.socket`. Each
+worker keeps a `pg::Pool` of its own, built in the worker before it serves, and each
+request a `pg::Ticket` in its state. The route calls `pg::query` at its request and
+again at each of its later events, and the call does what the event allows:
 
 ```goose
-import goose_io from "github.com/BHare1985/goose-io@<tag>";
+import http from "github.com/kaitk/goose-http@v0.5.16";
 import pg.pool;
 
-fn handle(io: Io&, ev: goose_io::Event, st: St&, db: pg::Pool&) {
-    pg::pool_event(db, io, ev);
+fn handle(ev: http::Event, st: St&, out: http::Reply, db: pg::Pool&) {
     var body: u8[>..] = [];
-    let n = pg::query(db, st.ticket, io, 5000, SQL, st.lo, st.hi) { r =>
+    let n = pg::query(db, st.ticket, out, ev.kind, ev.data, 5000, SQL, st.lo, st.hi) { r =>
         format(body, pg::text(r, 0), "\n");       // every row, in this one call
     };
     if n == pg::WAITS { return; }                 // the exchange waits; called again
-    if n == pg::FAILS { respond(503, db.reason); return; }
-    respond(200, body);
+    if n == pg::FAILS { http::respond(out, 503, "text/plain", db.reason); return; }
+    http::respond(out, 200, "text/plain", body);
 }
 
-var db = pg::pool(db_cfg, per_loop, TAG);         // DATABASE_MAX_CONN / loops
-io.serve() { io, ev => handle(io, ev, st, db); };
-pg::close(db, io);
+thread_fn worker(cfg: http::Config, db_cfg: pg::Config, per_worker: i64) {
+    var db = pg::pool(db_cfg, per_worker);        // DATABASE_MAX_CONN / workers
+    let e = http::serve_epoll(cfg, St { .. }) { ev, st, out => handle(ev, st, out, db); };
+    pg::close(db);
+}
 ```
 
-- `pg::pool(cfg, size, tag = 1) -> Pool`: `size` connections, at least one, none open
-  yet, whose links carry `tag`. Keep it last in the loop's state: its connections end it.
-- `pg::pool_event(pool, io, ev) -> bool`: takes what the loop delivers for the pool's
-  links into their buffers, true if the event was the pool's.
-- `pg::Ticket { .. }`: a request's place with the pool, in the request's state.
-  `t.code` holds a failure's SQLSTATE.
-- `pg::query(pool, t, io, ms, sql, p1, ..., p8) { r => ... } -> i64`: parameters are
+- `pg::pool(cfg, size) -> Pool`: `size` connections, at least one, none open yet.
+  Keep it last in the worker's state: its connections end it.
+- `pg::Ticket { .. }`: a request's place with the pool, in the request's state, which
+  goose-http starts afresh for each request. `t.code` holds a failure's SQLSTATE.
+- `pg::query(pool, t, out, kind, data, ms, sql, p1, ..., p8) { r => ... } -> i64`:
+  `kind` and `data` are the event's, `http::Event.kind` and `.data`. Parameters are
   as the facade's, up to eight. It returns `pg::WAITS` while the exchange waits for a
   connection or the server, the count of rows once the block has seen each of them,
   or `pg::FAILS`, with `t.code` and `pool.reason` saying why. Each wait lasts at most
-  `ms`, renewed by events of the request's own connection. When it runs out the call
-  gives the connection back and returns `FAILS`.
-- `pg::close(pool, io)`: ends the sessions and closes the links, when the loop is
-  stopping.
+  `ms`. At `TIMEOUT` or `CLOSED` it gives the connection back and returns `FAILS`.
+- `pg::close(pool)`: ends the sessions and closes the sockets, once the loop has
+  returned.
 
 What a call does, by the request's place:
 
 - **A connection.** It takes an idle open connection; or, below the pool's size, one
-  to open, and dials the `Config`'s host and port, a numeric address as goose-io's
-  are, authenticates, and sends the query, each step as the events arrive; or one
-  whose owner's time has run out. Otherwise it waits in the loop's queue, up to
-  `POOL_WAITERS` requests, past which it fails with `"53300"`.
+  to open, and connects to the `Config`'s host and port (`localhost`, an IP address,
+  or a Unix socket's directory; goose-http's loop resolves no names), authenticates,
+  and sends the query, a wait on the socket for each step; or one whose owner no
+  longer waits. Otherwise it waits in the worker's queue, up to `POOL_WAITERS`
+  requests, past which it fails with `"53300"`.
 - **The query.** The first time a connection runs a SQL text, the query's `Parse`
   goes with it, as the statement `gp<k>`, and later runs bind the name. Rows come in
   the text format.
 - **The answer.** It reads into the connection's buffer of `POOL_INPUT` bytes until
   the answer's ReadyForQuery is there, then calls the block with every row, gives
-  the connection to the first request in the queue, and returns. An answer longer than the buffer fails with
-  `"08006"`, and the connection is closed.
+  the connection to the first request in the queue, by mail to its exchange, and
+  returns. An answer longer than the buffer fails with `"08006"`, and the connection
+  is closed.
 - **A failure.** A connect refused, a server that refuses or ends the session, or
   one that breaks the protocol fails the request with the server's SQLSTATE, or
   `"08001"` or `"08006"`, and closes the connection; the next request to take it
-  dials again. A server's error for the query fails it with the server's code,
+  connects again. A server's error for the query fails it with the server's code,
   and the connection goes on. A connection the server ended while it was idle, as
   after a restart, is opened again for the next request rather than failing it.
-- **An exchange that ends early.** A request that is never called again leaves its
-  connection to the next request that finds none idle once its time has run out, which
-  drops the answer to the query before its own. A request in the queue whose time has
-  run out is skipped when a connection is handed on.
+- **An exchange that ends early.** A program that calls `pg::query` at `TIMEOUT` and
+  `CLOSED` gives the connection back then: closed after a `TIMEOUT`, as it is after
+  `CLOSED`. One that doesn't, as a Plod route can't yet, leaves it to the next
+  request that finds none idle, which drops the answer to the query before its own.
 
 ## Authentication
 
@@ -587,7 +596,7 @@ fails; the `Config` the caller passed still holds it.
 ## Not yet
 
 - Queries in parallel on the facade, as [Layers](#layers) says.
-- Host names for the pool, which goose-io's addresses don't take.
+- Host names for the pool, which goose-http's loop doesn't resolve.
 - A Unix socket's directory in a `postgres://` URL.
 - TLS: the package speaks to the server in the clear, so it suits a server on the same
   host or a private network. A URL whose `sslmode` asks for TLS is refused.
