@@ -419,14 +419,22 @@ users, is [architecture](architecture.md).
   ring and on IOCP, `wait_socket` fails with `ENOSYS`, and every pooled query fails
   with that reason. The module is `pg.pool`, beside `pg.socket`, which it imports
   for the server's address (2026-10-23, task 005).
-- **goose-io compatibility is a shim of the `http::` calls, not a change to the pool.**
-  `httpshim.goose` has the names `pool.goose` uses from goose-http (sockets, mail, `later`,
-  `wait_socket`) and implements them over goose-io's contract, so the pool's source differs only
-  in `httpshim::` for `http::`. goose-http's calls act on the loop they run in, so the shim keeps
-  that loop's state in globals, which a thread has its own copy of, and queues dials, sends, and
-  hang-ups for the host to run on its provider once per event with `httpshim::flush(io)`; the host
-  also turns events into the route calls goose-http would have made (`httpshim::next`). The
-  contract's addresses are numeric, so a host name fails the dial, as on goose-http's loop; a
-  host that starts with `/` dials the server's Unix socket on an event loop that supplies
-  goose-io's unix group (contract 0.2), and fails with `BadAddress` on one that does not. The
-  blocking facade stays on goose-http (2026-11-17).
+- **The pool is generic over goose-io's event loop, and goose-http keeps only the blocking
+  facade's socket.** The pool needs a connection's bytes, its opening and closing, and a clock,
+  which goose-io's contract gives on any loop that supplies it, so `pool.goose` calls the
+  contract's operations on the loop it is given (`dial`, `send`, `reset`, `now_ms`) and takes the
+  loop's events with `pg::pool_event`. This supersedes the decisions above that built the pool on
+  goose-http: its `wait_socket`, its mail, `later`, and `Reply`, and the module `pg.socket` that
+  the pool imported for the server's address, all of which belong to goose-http's server loop and
+  its exchanges. What the pool kept: a queue of waiting requests, which now holds their keys and
+  times and hands a connection over by making the first request its owner; each wait limited by
+  `ms` and renewed by its own connection's events; the statement cache; the failure codes. What it
+  gained: `pg::wake` names the one request an event concerns, so the program calls a request
+  when its connection has news and never scans the requests it has. What it lost: the program
+  does not give the pool a goose-http `Reply`, an event's kind, or a `CLOSED` for a client that
+  went (a request that is never called again is found by its time running out), and a host
+  name or a goose-http-only loop is not served. The host `/dir` dials the server's Unix socket
+  on a loop that supplies goose-io's unix group (contract 0.2). The pool copies each answer once,
+  from the loop's lent bytes into its connection's buffer, as goose-http's `recv` copied it from
+  the kernel. The facade and `pg.socket` stay on goose-http: the contract has no blocking
+  receive, and a coroutine layer over it is a later change (2026-11-17).

@@ -1,6 +1,6 @@
 // The pool (pool.goose) on goose-io's in-memory provider, against a server scripted by time: a cleartext
 // login, a query with a parameter and two rows, a second request that waits in the queue for the one
-// connection and fails, a dial that is refused, and a server at a Unix socket path. The first query is made
+// connection and fails, a dial that is refused, a server at a Unix socket path, and a server that never answers. The first query is made
 // before the loop runs, and the answers come after the session is ready.
 import std;
 import hash from "github.com/kaitk/goose-hash@v0.0.4";
@@ -8,7 +8,6 @@ import goose_io from "../../../..";
 import goose_io.memory;
 import pg from "../../";
 import pg.pool;
-import pg.httpshim;
 import check from "../lib/check/";
 
 // RowDescription for an int4 column "id" and a text column "name".
@@ -74,29 +73,27 @@ fn second_answer() -> u8[>..] {
     return out;
 }
 
-struct App { t1: pg::Ticket = pg::Ticket { .. }, t2: pg::Ticket = pg::Ticket { .. }, finished: i64 = 0, pool: pg::Pool }
+struct App { t1: pg::Ticket = pg::Ticket { .. }, t2: pg::Ticket = pg::Ticket { .. }, finished: i64 = 0, ms: i64 = 1000, pool: pg::Pool }
 
-// One request's route: its query at its request and at each wake, until it ends. The exchange's key is 1 or 2.
-fn route(app: App&, t: pg::Ticket&, key: u64, kind: u8, data: const u8[:]) {
+fn sql_of(n: i64) -> const u8[:] { return if n == 1 { "SELECT id, name FROM items WHERE id < $1" } else { "SELEC $1" }; }
+
+// One request's route: its query at its start and each time the pool names it, until it ends.
+fn route(app: App&, t: pg::Ticket&, n: i64, io: goose_io_memory::Loop&) {
     guard t.state != pg::TICKET_DONE else { return; }
-    let n = pg::query(app.pool, t, httpshim::Reply { key: key }, kind, data, 1000, sql_of(key), 3) { r => print("request ", key, " row: ", pg::int(r, 0), " ", pg::text(r, 1)); };
-    if n == pg::WAITS { return; }
-    if n == pg::FAILS { print("request ", key, " failed ", t.code[..], " ", app.pool.reason[..]); }
-    else { print("request ", key, ": ", n, " rows"); }
-    httpshim::end(key);
+    let r = pg::query(app.pool, t, io, app.ms, sql_of(n), 3) { r => print("request ", n, " row: ", pg::int(r, 0), " ", pg::text(r, 1)); };
+    if r == pg::WAITS { return; }
+    if r == pg::FAILS { print("request ", n, " failed ", t.code[..], " ", app.pool.reason[..]); }
+    else { print("request ", n, ": ", r, " rows"); }
     app.finished++;
 }
 
-fn sql_of(key: u64) -> const u8[:] { return if key == 1 { "SELECT id, name FROM items WHERE id < $1" } else { "SELEC $1" }; }
-
 fn event(app: App&, io: goose_io_memory::Loop&, ev: goose_io::Event) {
-    httpshim::event(io, ev);
+    pg::pool_event(app.pool, io, ev);
     loop {
-        var w = httpshim::Wake { .. };
-        if !httpshim::next(w) { break; }
-        if w.key == 1 { route(app, app.t1, 1, w.kind, w.data[..]); } else { route(app, app.t2, 2, w.kind, w.data[..]); }
+        let key = pg::wake(app.pool);
+        if key == 0 { break; }
+        if key == app.t1.key { route(app, app.t1, 1, io); } else if key == app.t2.key { route(app, app.t2, 2, io); }
     }
-    httpshim::flush(io);
     if app.finished == 2 { io.stop(0); }
 }
 
@@ -120,9 +117,8 @@ fn main() {
     io.peer_send(server, 20, first_answer());
     io.peer_send(server, 40, second_answer());
     var app = App { pool: pg::pool(config("10.0.0.5"), 1) };
-    route(app, app.t1, 1, httpshim::REQUEST, "");
-    route(app, app.t2, 2, httpshim::REQUEST, "");
-    httpshim::flush(io);
+    route(app, app.t1, 1, io);
+    route(app, app.t2, 2, io);
     io.serve() { io, ev => event(app, io, ev); };
     let sent = io.peer_received(server);
     check::that("the password went in cleartext", find(sent[..], "p\0\0\0\x07pw\0") >= 0);
@@ -133,8 +129,7 @@ fn main() {
     io2.peer_refuse(io2.add_peer(), "10.0.0.6:5432");
     var app2 = App { finished: 1, pool: pg::pool(config("10.0.0.6"), 2) };
     app2.t2.state = pg::TICKET_DONE;
-    route(app2, app2.t1, 1, httpshim::REQUEST, "");
-    httpshim::flush(io2);
+    route(app2, app2.t1, 1, io2);
     io2.serve() { io, ev => event(app2, io, ev); };
 
     print("-- a server on a Unix socket, as the host /var/run/postgresql names it");
@@ -146,8 +141,17 @@ fn main() {
     io3.peer_send(unix_server, 20, first_answer());
     var app3 = App { finished: 1, pool: pg::pool(config("/var/run/postgresql"), 1) };
     app3.t2.state = pg::TICKET_DONE;
-    route(app3, app3.t1, 1, httpshim::REQUEST, "");
-    httpshim::flush(io3);
+    route(app3, app3.t1, 1, io3);
     io3.serve() { io, ev => event(app3, io, ev); };
     check::that("the query went to the path as it went to an address", find(io3.peer_received(unix_server)[..], "p\0\0\0\x07pw\0") >= 0);
+
+    print("-- a server that never answers: the request that runs and the one that waits both time out");
+    var io4 = goose_io_memory::Loop { .. };
+    io4.peer_accept(io4.add_peer(), "10.0.0.7:5432");
+    var app4 = App { ms: 300, pool: pg::pool(config("10.0.0.7"), 1) };
+    route(app4, app4.t1, 1, io4);
+    route(app4, app4.t2, 2, io4);
+    io4.serve() { io, ev => event(app4, io, ev); };
+    check::that("the timed-out request gave its connection up", app4.pool.slots[0].owner == 0);
+    check::that("and the connection was hung up, as a server that doesn't answer may not answer at all", app4.pool.slots[0].phase == pg::SLOT_CLOSED);
 }
