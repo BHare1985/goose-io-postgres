@@ -509,9 +509,9 @@ pg::close(db, io);
 - `pg::query(pool, t, io, ms, sql, p1, ..., p8) { r => ... } -> i64`: parameters are
   as the facade's, up to eight. It returns `pg::WAITS` while the exchange waits for a
   connection or the server, the count of rows once the block has seen each of them,
-  or `pg::FAILS`, with `t.code` and `pool.reason` saying why. `ms` limits the whole
-  query, from its first call; when it runs out the call gives the connection back and
-  returns `FAILS`.
+  or `pg::FAILS`, with `t.code` and `pool.reason` saying why. Each wait lasts at most
+  `ms`, renewed by events of the request's own connection. When it runs out the call
+  gives the connection back and returns `FAILS`.
 - `pg::close(pool, io)`: ends the sessions and closes the links, when the loop is
   stopping.
 
@@ -520,13 +520,14 @@ What a call does, by the request's place:
 - **A connection.** It takes an idle open connection; or, below the pool's size, one
   to open, and dials the `Config`'s host and port, a numeric address as goose-io's
   are, authenticates, and sends the query, each step as the events arrive; or one
-  whose owner's time has run out. Otherwise it polls for one at each call.
+  whose owner's time has run out. Otherwise it waits in the loop's queue, up to
+  `POOL_WAITERS` requests, past which it fails with `"53300"`.
 - **The query.** The first time a connection runs a SQL text, the query's `Parse`
   goes with it, as the statement `gp<k>`, and later runs bind the name. Rows come in
   the text format.
 - **The answer.** It reads into the connection's buffer of `POOL_INPUT` bytes until
   the answer's ReadyForQuery is there, then calls the block with every row, gives
-  the connection back, and returns. An answer longer than the buffer fails with
+  the connection to the first request in the queue, and returns. An answer longer than the buffer fails with
   `"08006"`, and the connection is closed.
 - **A failure.** A connect refused, a server that refuses or ends the session, or
   one that breaks the protocol fails the request with the server's SQLSTATE, or
@@ -536,7 +537,8 @@ What a call does, by the request's place:
   after a restart, is opened again for the next request rather than failing it.
 - **An exchange that ends early.** A request that is never called again leaves its
   connection to the next request that finds none idle once its time has run out, which
-  drops the answer to the query before its own.
+  drops the answer to the query before its own. A request in the queue whose time has
+  run out is skipped when a connection is handed on.
 
 ## Authentication
 

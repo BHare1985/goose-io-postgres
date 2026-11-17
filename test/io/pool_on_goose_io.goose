@@ -1,6 +1,6 @@
 // The pool (pool.goose) on goose-io's in-memory provider, against a server scripted by time: a cleartext
-// login, a query with a parameter and two rows, a second query on the same connection that fails, and
-// a dial that is refused. The first query is made before the loop runs, and the answers come after
+// login, a query with a parameter and two rows, a second request that waits in the queue for the one
+// connection and fails, and a dial that is refused. The first query is made before the loop runs, and the answers come after
 // the session is ready.
 import std;
 import hash from "github.com/kaitk/goose-hash@v0.0.4";
@@ -88,7 +88,7 @@ fn run(app: App&, io: goose_io_memory::Loop&, t: pg::Ticket&, name: const u8[:],
 fn event(app: App&, io: goose_io_memory::Loop&, ev: goose_io::Event) {
     pg::pool_event(app.pool, io, ev);
     run(app, io, app.t1, "first", "SELECT id, name FROM items WHERE id < $1");
-    if app.t1.state == pg::TICKET_DONE { run(app, io, app.t2, "second", "SELEC $1"); }
+    run(app, io, app.t2, "second", "SELEC $1");
     if app.finished == 2 { io.stop(0); }
 }
 
@@ -103,7 +103,7 @@ fn config(host: const u8[:]) -> pg::Config {
 }
 
 fn main() {
-    print("-- two queries on one connection");
+    print("-- two requests, one connection: the second waits in the queue");
     var io = goose_io_memory::Loop { .. };
     let server = io.add_peer();
     io.peer_accept(server, "10.0.0.5:5432");
@@ -111,8 +111,9 @@ fn main() {
     io.peer_send(server, 5, login());
     io.peer_send(server, 20, first_answer());
     io.peer_send(server, 40, second_answer());
-    var app = App { pool: pg::pool(config("10.0.0.5"), 2, 7) };
+    var app = App { pool: pg::pool(config("10.0.0.5"), 1, 7) };
     run(app, io, app.t1, "first", "SELECT id, name FROM items WHERE id < $1");
+    run(app, io, app.t2, "second", "SELEC $1");
     io.serve() { io, ev => event(app, io, ev); };
     let sent = io.peer_received(server);
     check::that("the password went in cleartext", find(sent[..], "p\0\0\0\x07pw\0") >= 0);

@@ -1,4 +1,4 @@
--- two queries on one connection
+-- two requests, one connection: the second waits in the queue
 first row: 1 one
 first row: 2 two
 first: 2 rows

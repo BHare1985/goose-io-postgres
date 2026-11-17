@@ -420,13 +420,14 @@ users, is [architecture](architecture.md).
   with that reason. The module is `pg.pool`, beside `pg.socket`, which it imports
   for the server's address (2026-10-23, task 005).
 - **The pool runs on goose-io's contract, with `pg::pool` and `pg::query` as they
-  were.** goose-http's mail, `wait_socket`, and `recv` have no counterpart in the
-  contract, whose events are pushed, so `pg::pool_event` takes each event into its
-  connection's buffer and the route calls `pg::query` at every event, as it called it
-  at every wake; `query` takes `io` where it took `out, kind, data`. The queue of
-  waiting requests and its mail are gone: a request polls for a connection at each
-  call, so waiters are not served in order and `"53300"` no longer exists. `ms` limits
-  the whole query, since there is no wait to renew it, and a request that is never
-  called again is found by its time running out. Addresses are numeric. The blocking
+  were.** goose-http's `recv`, `send`, `connect_start`, and `hangup` act on the loop
+  they run in, with no argument for it, and goose-io's operations take the provider, so
+  the pool takes `io` where it took `out, kind, data`, and cannot sit on a shim of
+  `http::` that leaves its source alone. goose-io pushes events, so `pg::pool_event`
+  takes each one into its connection's buffer, and the route calls `pg::query` at every
+  event, as it called it at every wake. goose-http's mail and `later` have no
+  counterpart: the queue of waiting requests keeps their keys and times in the pool,
+  hands a connection over by making that request its owner, and a wait is renewed only
+  by events of the request's own connection. Addresses are numeric. The blocking
   facade stays on goose-http's socket: the contract has no blocking receive, and
   `serve` cannot be run for one read (2026-11-17).

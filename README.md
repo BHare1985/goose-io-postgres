@@ -29,7 +29,7 @@ per worker, runs single queries for a route without a lane, as HttpArena's
 | 🟢 | Transactions | `pg::transaction(db) { ... }` on the facade, as goose-sqlite's: it commits, or rolls back on a failed call or `pg::fail` and returns the error; nested, a savepoint that undoes only its own work. |
 | 🟡 | Queries in parallel | Several queries in one round trip on the facade (task 003). |
 | 🟢 | goose-http's blocking socket as the facade's transport | The module `pg.socket`: `pg::open` over TCP or a Unix socket, with a time limit on each wait. |
-| 🟡 | A pool | The module `pg.pool`: a pool per loop on any provider of [goose-io](https://github.com/BHare1985/goose-io)'s I/O contract, opened as requests need it, with reconnects after failures. Tested against goose-io's in-memory provider and a scripted server; not yet against a real provider or a live Postgres, and `test/live/pool.goose`, which drove it from goose-http's routes, is not ported (task 005). |
+| 🟡 | A pool | The module `pg.pool`: a pool per loop on any provider of [goose-io](https://github.com/BHare1985/goose-io)'s I/O contract, opened as requests need it, with a queue for requests that find no idle connection and reconnects after failures. Tested against goose-io's in-memory provider and a scripted server; not yet against a real provider or a live Postgres, and `test/live/pool.goose`, which drove it from goose-http's routes, is not ported (task 005). |
 | 🔴 | TLS | Through goose-tls's client mode, for servers that ask for it. Until then a URL with `sslmode=require`, `verify-ca`, or `verify-full` is refused. |
 | 🔴 | More types | Floats, `numeric`, dates and times, `uuid`, and arrays; `pg::bytes` gives their raw bytes. |
 

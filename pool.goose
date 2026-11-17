@@ -29,6 +29,12 @@ import hash from "github.com/kaitk/goose-hash@v0.0.4";
 // Each connection's buffer: the most one query's answer may take, and so
 // the longest message a pooled connection accepts.
 let POOL_INPUT = 65536;
+// The most requests that wait for a connection on one loop at once.
+let POOL_WAITERS = 1024;
+
+// The code of a request that found every connection busy and the queue full,
+// Postgres's too_many_connections.
+let TOO_MANY_CONNECTIONS = "53300";
 
 // What query returns, besides a count of rows.
 let WAITS = -1;   // the exchange waits: return from the handler
@@ -42,7 +48,7 @@ let SLOT_OPEN: u8 = 3;
 
 // A request's place with the pool, in the request's state.
 let TICKET_NEW: u8 = 0;
-let TICKET_QUEUED: u8 = 1;     // polls for a connection at each call
+let TICKET_QUEUED: u8 = 1;     // waits for a connection to be handed over
 let TICKET_HAVE: u8 = 2;       // owns connection `conn`
 let TICKET_DONE: u8 = 3;
 
@@ -54,10 +60,13 @@ struct Ticket {
     first: i64 = -1,
     parse: i64 = -1,
     statement: i64 = -1,
-    // The request's number in the pool, and when it gives up, in the loop's
-    // clock: 0 for never.
+    // The request's number in the pool, the limit on each wait, when the
+    // current wait ends in the loop's clock (0: never), and the activity of
+    // its connection that wait began at.
     key: u32 = 0,
+    ms: i64 = 0,
     deadline: i64 = 0,
+    seen: i64 = 0,
     // Why query returned FAILS: a SQLSTATE, the server's or one of the
     // facade's codes.
     code: u8[..5],
@@ -76,6 +85,8 @@ struct Slot {
     eof: bool = false,
     owner: u32 = 0,
     until: i64 = 0,
+    // How many events the connection has had, so a wait is renewed only by its own.
+    seen: i64 = 0,
     // Bit k: the pool's statement k is prepared on this connection.
     prepared: u64 = 0,
     // input[at..len] holds what has arrived and step hasn't read.
@@ -85,9 +96,13 @@ struct Slot {
     input: u8[POOL_INPUT],
 }
 
-// A loop's connections, with the settings to open them and the statements
-// prepared on them by name. Build it in the thread that serves, with pool, and
-// keep it last in that thread's state: the connections end it.
+// A request waiting for a connection: its key, and when it gives up.
+struct Waiter { key: u32 = 0, until: i64 = 0 }
+
+// A loop's connections, with the settings to open them, the statements
+// prepared on them by name, and the requests waiting for one. Build it in the
+// thread that serves, with pool, and keep it last in that thread's state: the
+// connections end it.
 struct Pool {
     cfg: Config,
     tag: u16 = 1,
@@ -96,6 +111,10 @@ struct Pool {
     statements: i64 = 0,
     ends: i32[STATEMENTS],
     sql: u8[..STATEMENT_TEXT],
+    // A ring of the requests waiting, from waiters[head].
+    head: i64 = 0,
+    waiting: i64 = 0,
+    waiters: Waiter[POOL_WAITERS],
     // Why the last query that failed did.
     reason: u8[..120],
     slots: Slot[>..],
@@ -121,6 +140,7 @@ fn pool_event<Io>(p: Pool&, io: Io&, ev: goose_io::Event) -> bool {
     guard user >= 1 && user <= p.slots.len else { return true; }
     let s .= p.slots[user - 1];
     guard goose_io::same(s.link, goose_io::link_of(ev)) else { return true; }
+    s.seen++;
     match ev {
         Opened e => { s.up = true; },
         Closed e => { s.eof = true; },
@@ -250,18 +270,24 @@ fn pooled<R, W>(p: Pool&, t: Ticket&, io, ms: i64, sql: const u8[:]) -> i64 {
         if t.state == TICKET_HAVE && owns(p, t) {
             // A server that doesn't answer in time may not answer at all.
             hang_up(p.slots[t.conn], io);
-            release(p, t.conn);
+            release(p, io, t.conn);
         }
         return fails(p, t, CONNECTION_FAILURE, "the database didn't answer in time");
+    }
+    if t.state == TICKET_QUEUED {
+        var k = -1;
+        for i in p.slots.len { if p.slots[i].owner == t.key { k = i; } }
+        guard k >= 0 else { return WAITS; }
+        t.state = TICKET_HAVE;
+        t.conn = k;
+        t.seen = p.slots[k].seen;
     }
     if t.state == TICKET_NEW {
         guard !has_nul(sql) else { return fails(p, t, CHARACTER_NOT_IN_REPERTOIRE, "the SQL holds a NUL byte"); }
         t.key = p.next_key;
         p.next_key = if p.next_key == 0xffffffff { 1 } else { p.next_key + 1 };
+        t.ms = ms;
         t.deadline = if ms > 0 { io.now_ms() + ms } else { 0 };
-        t.state = TICKET_QUEUED;
-    }
-    if t.state == TICKET_QUEUED {
         let r = acquire(p, t, io);
         guard r == 0 else { return r; }
     }
@@ -270,31 +296,70 @@ fn pooled<R, W>(p: Pool&, t: Ticket&, io, ms: i64, sql: const u8[:]) -> i64 {
 }
 
 // Gives t a connection: an idle open one, then one without an owner to open,
-// then one whose owner's time has run out; WAITS when there is none, and t
-// asks again at its next call. 0 when t has one.
-fn acquire(p: Pool&, t: Ticket&, io) -> i64 {
-    var idle = -1;
-    var unowned = -1;
-    var abandoned = -1;
-    for k in p.slots.len {
-        let s .= p.slots[k];
-        if s.owner == 0 {
-            if s.phase == SLOT_OPEN {
-                idle = k;
-                break;
+// then one whose owner's time has run out, which goes to the queue's first
+// request when there is one; or queues t, or fails when the queue is full.
+// 0 when t has one.
+fn acquire<Io>(p: Pool&, t: Ticket&, io: Io&) -> i64 {
+    let now = io.now_ms();
+    loop {
+        var idle = -1;
+        var unowned = -1;
+        var abandoned = -1;
+        for k in p.slots.len {
+            let s .= p.slots[k];
+            if s.owner == 0 {
+                if s.phase == SLOT_OPEN {
+                    idle = k;
+                    break;
+                }
+                if unowned < 0 { unowned = k; }
+            } else if abandoned < 0 && s.until != 0 && now >= s.until {
+                abandoned = k;
             }
-            if unowned < 0 { unowned = k; }
-        } else if abandoned < 0 && s.until != 0 && io.now_ms() >= s.until {
-            abandoned = k;
+        }
+        if idle < 0 && unowned < 0 && abandoned >= 0 && p.waiting > 0 {
+            // Leaves it with a waiter, or with no owner if none still waits.
+            release(p, io, abandoned);
+            continue;
+        }
+        // An idle connection while requests wait is one that no one took yet:
+        // it goes to the queue.
+        if idle >= 0 && p.waiting > 0 {
+            release(p, io, idle);
+            if p.slots[idle].owner != 0 { continue; }
+        }
+        let k = if idle >= 0 { idle } else if unowned >= 0 { unowned } else { abandoned };
+        guard k < 0 else {
+            p.slots[k].owner = t.key;
+            p.slots[k].until = t.deadline;
+            t.state = TICKET_HAVE;
+            t.conn = k;
+            t.seen = p.slots[k].seen;
+            return 0;
+        }
+        break;
+    }
+    if p.waiting == POOL_WAITERS { forget_gone_waiters(p, now); }
+    guard p.waiting < POOL_WAITERS else {
+        return fails(p, t, TOO_MANY_CONNECTIONS, "every connection is busy, and POOL_WAITERS requests wait");
+    }
+    p.waiters[(p.head + p.waiting) % POOL_WAITERS] = Waiter { key: t.key, until: t.deadline };
+    p.waiting++;
+    t.state = TICKET_QUEUED;
+    return WAITS;
+}
+
+// Drops the waiters whose time has run out from p's queue, keeping the order.
+fn forget_gone_waiters(p: Pool&, now: i64) {
+    var kept = 0;
+    for i in p.waiting {
+        let w = p.waiters[(p.head + i) % POOL_WAITERS];
+        if w.until == 0 || now < w.until {
+            p.waiters[(p.head + kept) % POOL_WAITERS] = w;
+            kept++;
         }
     }
-    let k = if idle >= 0 { idle } else if unowned >= 0 { unowned } else { abandoned };
-    guard k >= 0 else { return WAITS; }
-    p.slots[k].owner = t.key;
-    p.slots[k].until = t.deadline;
-    t.state = TICKET_HAVE;
-    t.conn = k;
-    return 0;
+    p.waiting = kept;
 }
 
 // Whether t still owns its connection.
@@ -302,9 +367,37 @@ fn owns(p: const Pool&, t: const Ticket&) -> bool {
     return t.conn >= 0 && t.conn < p.slots.len && p.slots[t.conn].owner == t.key;
 }
 
-// Gives connection k up, to the next request that polls for one.
-fn release(p: Pool&, k: i64) {
-    p.slots[k].owner = 0;
+// Hands connection k to the first request in the queue whose time hasn't run
+// out, or leaves it idle.
+fn release<Io>(p: Pool&, io: Io&, k: i64) {
+    let s .= p.slots[k];
+    s.owner = 0;
+    s.until = 0;
+    let now = io.now_ms();
+    while p.waiting > 0 {
+        let w = p.waiters[p.head];
+        p.head = (p.head + 1) % POOL_WAITERS;
+        p.waiting--;
+        if w.until == 0 || now < w.until {
+            s.owner = w.key;
+            s.until = w.until;
+            return;
+        }
+    }
+}
+
+// Waits for t's connection to have something new, with t's limit on the wait
+// renewed by the connection's own events, not by the loop's others.
+fn wait<Io>(p: Pool&, t: Ticket&, io: Io&) -> i64 {
+    let s .= p.slots[t.conn];
+    if s.seen != t.seen {
+        t.seen = s.seen;
+        if t.ms > 0 {
+            t.deadline = io.now_ms() + t.ms;
+            s.until = t.deadline;
+        }
+    }
+    return WAITS;
 }
 
 // Drives t's connection as far as it can go without waiting: connects,
@@ -321,13 +414,13 @@ fn drive<R, W>(p: Pool&, t: Ticket&, io, ms: i64, sql: const u8[:]) -> i64 {
             s.up = false;
             s.eof = false;
             s.phase = SLOT_CONNECTING;
-            return WAITS;
+            return wait(p, t, io);
         }
         if s.phase == SLOT_CONNECTING {
             if s.eof {
                 return down(p, t, io, SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION, "can't connect to the database");
             }
-            guard s.up else { return WAITS; }
+            guard s.up else { return wait(p, t, io); }
             var nonce: u8[18] = [0; 18];
             hash::random_bytes(nonce);
             var o: u8[>..] = [];
@@ -338,7 +431,7 @@ fn drive<R, W>(p: Pool&, t: Ticket&, io, ms: i64, sql: const u8[:]) -> i64 {
             guard s.c.state != BROKEN else { return down(p, t, io, SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION, s.c.reason); }
             guard io.send(s.link, o) == goose_io::SendStatus.Sent else { return down(p, t, io, CONNECTION_FAILURE, "sending to the server failed"); }
             s.phase = SLOT_STARTING;
-            return WAITS;
+            return wait(p, t, io);
         }
         let open = !s.eof;
         if s.phase == SLOT_OPEN && t.first < 0 {
@@ -397,7 +490,7 @@ fn send_query<W>(p: Pool&, t: Ticket&, io, sql: const u8[:]) -> i64 {
     // with this code once the server has answered the rest.
     if q < 0 { t.code.append("54023"); }
     guard io.send(s.link, o) == goose_io::SendStatus.Sent else { return down(p, t, io, CONNECTION_FAILURE, "sending to the server failed"); }
-    return WAITS;
+    return wait(p, t, io);
 }
 
 fn bit(k: i64) -> u64 { (1 as u64) << k }
@@ -458,7 +551,7 @@ fn answer<R>(p: Pool&, t: Ticket&, io, open: bool) -> i64 {
             }
         } else if e == READY {
             compact(s);
-            release(p, t.conn);
+            release(p, io, t.conn);
             if failed { return fails(p, t, code, message); }
             guard t.code.len == 0 else { return fails(p, t, "54023", "more than 65535 parameters, Postgres's limit"); }
             t.state = TICKET_DONE;
@@ -486,7 +579,7 @@ fn more(p: Pool&, t: Ticket&, io, open: bool) -> i64 {
     let s .= p.slots[t.conn];
     if open {
         compact(s);
-        return WAITS;
+        return wait(p, t, io);
     }
     loop {
         var o: u8[>..] = [];
@@ -534,7 +627,7 @@ fn hang_up<Io>(s: Slot&, io: Io&) {
 // t's connection failed: closes it, hands it on, and fails t.
 fn down<Io>(p: Pool&, t: Ticket&, io: Io&, code: const u8[:], why: const u8[:]) -> i64 {
     hang_up(p.slots[t.conn], io);
-    release(p, t.conn);
+    release(p, io, t.conn);
     return fails(p, t, code, why);
 }
 
